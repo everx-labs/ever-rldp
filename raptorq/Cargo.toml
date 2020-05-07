@@ -1,0 +1,34 @@
+[package]
+edition = "2018"
+name = "raptorq"
+description = "RaptorQ (RFC6330), forked from https://github.com/cberner/raptorq"
+version = "1.2.1"
+authors = ["Christopher Berner <christopherberner@gmail.com>"]
+
+[dependencies]
+serde = {version = "1.0.102", features=["std", "derive"]}
+
+[dev-dependencies]
+criterion = "0.3"
+primal = "0.2"
+rand = "0.7"
+threadpool = "1.7"
+
+[[bench]]
+name = "codec_benchmark"
+harness = false
+
+[[bench]]
+name = "matrix_sparsity"
+harness = false
+
+[[bench]]
+name = "encode_benchmark"
+harness = false
+
+[[bench]]
+name = "decode_benchmark"
+harness = false
+
+[features]   
+benchmarking = []

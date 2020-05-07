@@ -1,0 +1,30 @@
+[package]
+edition = "2018"
+build = "./common/build/build.rs"
+name = "rldp"
+version = "0.0.1"
+description = "RLDP library"
+
+[dependencies]
+base64 = "0.11.0"
+failure = "0.1.6"
+lockfree = "0.5.1"
+log = "0.4.8"
+rand = "0.7.2"
+raptorq = { version = "1.2.1", path = "raptorq" }
+tokio = { version = "0.2.5", features = ["rt-threaded", "stream", "tcp", "udp"] }
+
+adnl = { git = "https://github.com/tonlabs/ton-labs-adnl", package = "adnl", features = ["node"] }
+ton_api = { git = "https://github.com/tonlabs/ton-labs-tl.git", package = "ton_api" }
+ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
+
+[dev-dependencies]
+arrayref = "0.3.5"
+hex = "^0"
+log4rs = "0.8.3"
+overlay = { git = "https://github.com/tonlabs/ton-labs-overlay.git" }
+sha2 = "0.8.0"
+
+
+
+
