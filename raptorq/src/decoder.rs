@@ -208,22 +208,23 @@ impl SourceBlockDecoder {
             } else {
                 payload_id.encoding_symbol_id()
             };
-println!("EXTSYMBOLS {}/{}", num_extended_symbols, self.source_block_symbols);
+//println!("EXTSYMBOLS {}/{}", num_extended_symbols, self.source_block_symbols);
             if self.received_esi.insert(symbol_id) {
                 if symbol_id >= num_extended_symbols {
-println!("REPAIR {}", symbol_id);
+//println!("REPAIR {}", symbol_id);
                     // Repair symbol
                     self.repair_packets.push(
                         EncodingPacket::new(PayloadId::new(0, symbol_id), payload)
                     );
                 } else {
-println!("SOURCE {}", symbol_id);
+//println!("SOURCE {}", symbol_id);
                     // Check that this is not an extended symbol (which aren't explicitly sent)
                     assert!(symbol_id < self.source_block_symbols);
                     // Source symbol
                     self.source_symbols[symbol_id as usize] =
                         Some(Symbol::new(payload));
                     self.received_source_symbols += 1;
+//println!("RECEIVED SOURCE {}", self.received_source_symbols);
                 }
             }
         }
@@ -237,6 +238,7 @@ println!("SOURCE {}", symbol_id);
                 .map(|symbol| symbol.unwrap().into_bytes())
                 .flatten()
                 .collect();
+//println!("DECODED!");
 
             self.decoded = true;
             return Some(result);
