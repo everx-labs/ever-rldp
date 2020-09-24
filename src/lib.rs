@@ -176,7 +176,6 @@ impl RecvTransfer {
                 confirm.part = message.part;
                 confirm.seqno = max_seqno as i32;
                 self.confirm_count = 0;
-println!("\n\n\nConfirm {}", max_seqno);
                 serialize_inplace(&mut self.buf, &self.confirm)?;
                 Ok(Some(&self.buf[..]))
             } else {
@@ -273,8 +272,10 @@ impl <'a> SendTransfer<'a> {
     const SYMBOL: usize = 768;
     const WINDOW: usize = 1000;
 
-    fn new(data: &'a [u8]) -> Self {
-        let transfer_id: TransferId = rand::thread_rng().gen();
+    fn new(data: &'a [u8], transfer_id: Option<TransferId>) -> Self {
+        let transfer_id = transfer_id.unwrap_or_else(
+            || rand::thread_rng().gen()
+        );
         let message = RldpMessagePart {
             transfer_id: ton::int256(transfer_id),
             fec_type: FecTypeRaptorQ {
@@ -567,7 +568,11 @@ impl RldpNode {
         }        
     }
 
-    fn answer_transfer(&self, transfer_id: &TransferId, peers: &AdnlPeers) -> Result<()> {
+    fn answer_transfer(
+        &self, 
+        transfer_id: &TransferId, 
+        peers: &AdnlPeers
+    ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<Box<RldpMessagePart>>>> {
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
         let inserted = add_object_to_map(
             &self.transfers, 
@@ -575,7 +580,7 @@ impl RldpNode {
             || Ok(RldpTransfer::Recv(queue_sender.clone()))
         )?;
         if !inserted {
-            return Ok(())
+            return Ok(None)
         }
         let all = RldpStats::inc(&self.stats.transfers_recv_all);
         let now = RldpStats::inc(&self.stats.transfers_recv_now);
@@ -626,7 +631,7 @@ impl RldpNode {
                 transfers.insert(transfer_id, RldpTransfer::Done);
             }
         );
-        Ok(())
+        Ok(Some(queue_sender))
     }
 
     async fn answer_transfer_loop(
@@ -659,7 +664,14 @@ impl RldpNode {
         for i in 0..send_transfer_id.len() {
             send_transfer_id[i] ^= 0xFF
         } 
-        let send_transfer = SendTransfer::new(&data[..]);
+        log::trace!(
+            target: TARGET, 
+            "RLDP answer to be sent in transfer {}/{} to {}",
+            base64::encode(&context.transfer_id),
+            base64::encode(&send_transfer_id),
+            context.peers.other()  
+        );
+        let send_transfer = SendTransfer::new(&data[..], Some(send_transfer_id.clone()));
         transfers.insert(
             send_transfer_id.clone(), 
             RldpTransfer::Send(send_transfer.state.clone())
@@ -703,7 +715,7 @@ impl RldpNode {
         timeout_adnl: u64,
         timeout_rldp: u64
     ) -> Result<Option<Vec<u8>>> {  
-        let send_transfer = SendTransfer::new(data);
+        let send_transfer = SendTransfer::new(data, None);
         let send_transfer_id = send_transfer.message.transfer_id().0.clone();
         self.transfers.insert(
             send_transfer_id.clone(), 
@@ -734,8 +746,10 @@ impl RldpNode {
         }; 
         log::trace!(
             target: TARGET, 
-            "transfer id {}, total to send {}", 
-            base64::encode(&send_transfer_id), data.len()
+            "transfer id {}/{}, total to send {}", 
+            base64::encode(&send_transfer_id), 
+            base64::encode(&recv_transfer_id), 
+            data.len()
         );
         let ret = self
             .query_transfer_loop(send_context, recv_context, timeout_adnl, timeout_rldp)
@@ -969,15 +983,25 @@ impl Subscriber for RldpNode {
             },
             RldpMessagePartBoxed::Rldp_MessagePart(msg) => {
                 let transfer_id = get256(&msg.transfer_id);
-                if let Some(transfer) = self.transfers.get(transfer_id) {
-                    if let RldpTransfer::Recv(queue_sender) = transfer.val() {   
-                        match queue_sender.send(msg) {
-                            Ok(()) => (),
-                            Err(tokio::sync::mpsc::error::SendError(_)) => ()
+                loop {
+                    let result = if let Some(transfer) = self.transfers.get(transfer_id) {
+                        if let RldpTransfer::Recv(queue_sender) = transfer.val() {   
+                            queue_sender.send(msg)
+                        } else {
+                            break
                         }
+                    } else {
+                        if let Some(queue_sender) = self.answer_transfer(transfer_id, peers)? {
+                            queue_sender.send(msg)
+                        } else {
+                            continue
+                        }
+                    };
+                    match result {
+                        Ok(()) => (),
+                        Err(tokio::sync::mpsc::error::SendError(_)) => ()
                     }
-                } else {
-                    self.answer_transfer(transfer_id, peers)?;
+                    break
                 }
             }
         }

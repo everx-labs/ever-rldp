@@ -204,10 +204,11 @@ impl SourceBlockDecoder {
 
             let (payload_id, payload) = packet.split();
             let symbol_id = if payload_id.encoding_symbol_id() >= self.source_block_symbols { 
-                payload_id.encoding_symbol_id() + num_extended_symbols - self.source_block_symbols
+                payload_id.encoding_symbol_id() + num_extended_symbols - self.source_block_symbols 
             } else {
                 payload_id.encoding_symbol_id()
             };
+
 //println!("EXTSYMBOLS {}/{}", num_extended_symbols, self.source_block_symbols);
             if self.received_esi.insert(symbol_id) {
                 if symbol_id >= num_extended_symbols {

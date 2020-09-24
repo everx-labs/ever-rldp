@@ -198,17 +198,18 @@ impl SourceBlockEncoder {
 
     // See section 5.3.4
     pub fn repair_packets(&self, start_repair_symbol_id: u32, packets: u32) -> Vec<EncodingPacket> {
-        let start_encoding_symbol_id = start_repair_symbol_id
-            + extended_source_block_symbols(self.source_symbols.len() as u32);
+        let source_symbols = self.source_symbols.len() as u32;
+        let start_encoding_symbol_id = start_repair_symbol_id - source_symbols 
+            + extended_source_block_symbols(source_symbols);
         let mut result = vec![];
-        let lt_symbols = num_lt_symbols(self.source_symbols.len() as u32);
-        let pi_symbols = num_pi_symbols(self.source_symbols.len() as u32);
-        let sys_index = systematic_index(self.source_symbols.len() as u32);
-        let p1 = calculate_p1(self.source_symbols.len() as u32, pi_symbols);
+        let lt_symbols = num_lt_symbols(source_symbols);
+        let pi_symbols = num_pi_symbols(source_symbols);
+        let sys_index = systematic_index(source_symbols as u32);
+        let p1 = calculate_p1(source_symbols, pi_symbols);
         for i in 0..packets {
             let tuple = intermediate_tuple(start_encoding_symbol_id + i, lt_symbols, sys_index, p1);
             result.push(EncodingPacket::new(
-                PayloadId::new(self.source_block_id, start_encoding_symbol_id + i),
+                PayloadId::new(self.source_block_id, start_repair_symbol_id + i),
                 enc(
                     self.source_symbols.len() as u32,
                     &self.intermediate_symbols,
