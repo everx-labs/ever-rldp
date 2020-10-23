@@ -637,7 +637,7 @@ impl RldpNode {
     async fn answer_transfer_loop(
         context: &mut RldpRecvContext, 
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
-        transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>
+        transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
     ) -> Result<Option<TransferId>> { 
         let query = match deserialize(
             &context.recv_transfer.data[..]
@@ -646,7 +646,11 @@ impl RldpNode {
             Ok(message) => fail!("Unexpected RLDP message: {:?}", message),
             Err(object) => fail!("Unexpected RLDP message: {:?}", object)
         };
-        let answer = if let (true, answer) = Query::process_rldp(&subscribers, &query).await? {
+        let answer = if let (true, answer) = Query::process_rldp(
+            &subscribers, 
+            &query, 
+            &context.peers
+        ).await? {
             if let Some(answer) = answer {
                 answer
             } else {
