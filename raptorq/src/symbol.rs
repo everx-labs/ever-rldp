@@ -56,27 +56,3 @@ impl<'a> AddAssign<&'a Symbol> for Symbol {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use rand::Rng;
-
-    use crate::symbol::Symbol;
-
-    #[test]
-    fn add_assign() {
-        let symbol_size = 41;
-        let mut data1: Vec<u8> = vec![0; symbol_size];
-        let mut data2: Vec<u8> = vec![0; symbol_size];
-        let mut result: Vec<u8> = vec![0; symbol_size];
-        for i in 0..symbol_size {
-            data1[i] = rand::thread_rng().gen();
-            data2[i] = rand::thread_rng().gen();
-            result[i] = data1[i] ^ data2[i];
-        }
-        let mut symbol1 = Symbol::new(data1);
-        let symbol2 = Symbol::new(data2);
-
-        symbol1 += &symbol2;
-        assert_eq!(result, symbol1.into_bytes());
-    }
-}

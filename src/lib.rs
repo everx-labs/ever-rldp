@@ -215,7 +215,11 @@ impl RaptorqEncoder {
         let engine = raptorq::Encoder::with_defaults(data, SendTransfer::SYMBOL as u16); 
         let mut source_packets = Vec::new();
         for encoder in engine.get_block_encoders() {
-            source_packets.append(&mut encoder.source_packets())
+            // Reverse order to send efficiently
+            let mut packets = encoder.source_packets();
+            while let Some(packet) = packets.pop() {
+                source_packets.push(packet)
+            }
         }
         Self {
             encoder_index: 0,
