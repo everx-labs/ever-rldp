@@ -282,25 +282,3 @@ impl BoolArrayMap {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::arraymap::ImmutableListMapBuilder;
-
-    #[test]
-    fn list_map() {
-        let mut builder = ImmutableListMapBuilder::new(10);
-        builder.add(0, 1);
-        builder.add(3, 1);
-        builder.add(3, 2);
-
-        let map = builder.build();
-        assert!(map.get(0).contains(&1));
-        assert!(!map.get(0).contains(&2));
-
-        assert!(map.get(3).contains(&1));
-        assert!(map.get(3).contains(&2));
-        assert!(!map.get(3).contains(&3));
-
-        assert!(!map.get(2).contains(&1));
-    }
-}

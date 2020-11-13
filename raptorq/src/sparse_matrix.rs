@@ -455,14 +455,3 @@ impl BinaryMatrix for SparseBinaryMatrix {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::systematic_constants::{num_intermediate_symbols, MAX_SOURCE_SYMBOLS_PER_BLOCK};
-
-    #[test]
-    fn check_max_width_optimization() {
-        // Check that the optimization of limiting matrix width to 2^16 is safe.
-        // Matrix width will never exceed L
-        assert!(num_intermediate_symbols(MAX_SOURCE_SYMBOLS_PER_BLOCK) < 65536);
-    }
-}
