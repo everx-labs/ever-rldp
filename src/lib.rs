@@ -8,7 +8,7 @@ use adnl::{
 };
 use rand::Rng;
 use std::{
-    cmp::min, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, 
+    cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, 
     time::{Duration, Instant}
 };
 use ton_api::{
@@ -468,7 +468,7 @@ pub struct RldpNode {
 
 impl RldpNode {
 
-    const SPINNER: u32 = 10000000; // Nanoseconds
+    const SPINNER: u64 = 10;       // Milliseconds
     const TIMEOUT: u64 = 10000;    // Milliseconds
 
     /// Constructor 
@@ -492,9 +492,8 @@ impl RldpNode {
         data: &[u8],
         max_answer_size: Option<i64>,
         peers: &AdnlPeers,
-        roundtrip_adnl: Option<u64>,
-        roundtrip_rldp: Option<u64>
-    ) -> Result<Option<Vec<u8>>> {
+        roundtrip: Option<u64>
+    ) -> Result<(Option<Vec<u8>>, u64)> {
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
             query_id: ton::int256(query_id.clone()),
@@ -532,12 +531,7 @@ impl RldpNode {
         let all = RldpStats::inc(&self.stats.transfers_sent_all);
         let now = RldpStats::inc(&self.stats.transfers_sent_now);
         log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
-        let res = self.query_transfer(
-            &msg, 
-            peers, 
-            AdnlNode::calc_timeout(roundtrip_adnl),
-            Self::calc_timeout(roundtrip_rldp)
-        ).await;
+        let res = self.query_transfer(&msg, peers, Self::calc_timeout(roundtrip)).await;
         let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
         let now = RldpStats::dec(&self.stats.transfers_sent_now);
         log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
@@ -547,10 +541,11 @@ impl RldpNode {
                     pong.wait().await;
                     break;
                 }
-                tokio::time::delay_for(Duration::new(0, Self::SPINNER)).await;
+                tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
             }
         }
-        if let Some(answer) = res? {
+        let (answer, roundtrip) = res?;
+        if let Some(answer) = answer {
             match deserialize(&answer[..])?.downcast::<RldpMessageBoxed>() {
                 Ok(RldpMessageBoxed::Rldp_Answer(answer)) => if answer.query_id.0 != query_id {
                     fail!("Unknown query ID in RLDP answer")
@@ -560,7 +555,7 @@ impl RldpNode {
                         "RLDP answer {:02x}{:02x}{:02x}{:02x}...", 
                         answer.data[0], answer.data[1], answer.data[2], answer.data[3]
                     );
-                    Ok(Some(answer.data.to_vec()))
+                    Ok((Some(answer.data.to_vec()), roundtrip))
                 },
                 Ok(answer) => 
                     fail!("Unexpected answer to RLDP query: {:?}", answer),
@@ -568,7 +563,7 @@ impl RldpNode {
                     fail!("Unexpected answer to RLDP query: {:?}", answer)
             }
         } else {
-            Ok(None)
+            Ok((None, roundtrip))
         }        
     }
 
@@ -620,7 +615,7 @@ impl RldpNode {
                 let all = stats.transfers_recv_all.load(Ordering::Relaxed);
                 let now = RldpStats::dec(&stats.transfers_recv_now);
                 log::trace!(target: TARGET, "RLDP recv stats: all {}, now {}", all, now);
-                tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT * 2)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT * 2)).await;
                 if let Some(send_transfer_id) = send_transfer_id {
                     transfers.remove(&send_transfer_id);
                 }
@@ -631,7 +626,7 @@ impl RldpNode {
         let transfer_id = transfer_id.clone();
         tokio::spawn(
             async move {
-                tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT)).await;
                 transfers.insert(transfer_id, RldpTransfer::Done);
             }
         );
@@ -690,11 +685,7 @@ impl RldpNode {
             send_transfer,
             transfer_id: context.transfer_id.clone()
         };
-        if Self::send_loop(
-            context_send, 
-            AdnlNode::calc_timeout(None), 
-            Self::calc_timeout(None)
-        ).await? {
+        if let (true, _) = Self::send_loop(context_send, Self::calc_timeout(None)).await? {
             log::trace!(
                 target: TARGET, 
                 "RLDP answer sent in transfer {} to {}",
@@ -713,16 +704,19 @@ impl RldpNode {
     }
 
     fn calc_timeout(roundtrip: Option<u64>) -> u64 {
-        roundtrip.unwrap_or(Self::TIMEOUT)
+        max(roundtrip.unwrap_or(Self::TIMEOUT), Self::SPINNER * 2)
+    }
+
+    fn is_timed_out(timeout: u64, updates: u32, start: &Instant) -> bool {
+        start.elapsed().as_millis() as u64 > timeout + timeout * updates as u64 / 100
     }
 
     async fn query_transfer(
         &self, 
         data: &[u8],
         peers: &AdnlPeers,
-        timeout_adnl: u64,
-        timeout_rldp: u64
-    ) -> Result<Option<Vec<u8>>> {  
+        timeout: u64
+    ) -> Result<(Option<Vec<u8>>, u64)> {  
         let send_transfer = SendTransfer::new(data, None);
         let send_transfer_id = send_transfer.message.transfer_id().0.clone();
         self.transfers.insert(
@@ -760,7 +754,7 @@ impl RldpNode {
             data.len()
         );
         let ret = self
-            .query_transfer_loop(send_context, recv_context, timeout_adnl, timeout_rldp)
+            .query_transfer_loop(send_context, recv_context, timeout)
             .await;
         if ret.is_err() {
             self.transfers.insert(send_transfer_id, RldpTransfer::Done);
@@ -769,7 +763,7 @@ impl RldpNode {
         let transfers = self.transfers.clone();
         tokio::spawn(
             async move {
-                tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT * 2)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT * 2)).await;
                 transfers.remove(&send_transfer_id); 
                 transfers.remove(&recv_transfer_id); 
             }
@@ -781,9 +775,8 @@ impl RldpNode {
         &self, 
         send_context: RldpSendContext<'_>, 
         mut recv_context: RldpRecvContext, 
-        timeout_adnl: u64,
-        timeout_rldp: u64
-    ) -> Result<Option<Vec<u8>>> {
+        timeout: u64,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
         let ping = Arc::new(lockfree::queue::Queue::new());
         let pong = ping.clone();
         let peers = send_context.peers.clone();
@@ -796,7 +789,7 @@ impl RldpNode {
                 pong.push(recv_context.recv_transfer)
             }
         );
-        let ok = Self::send_loop(send_context, timeout_adnl, timeout_rldp).await?;
+        let (ok, mut timeout) = Self::send_loop(send_context, timeout).await?;
         self.transfers.insert(transfer_id.clone(), RldpTransfer::Done);
         if ok {
             log::trace!(
@@ -808,17 +801,17 @@ impl RldpNode {
         } else {
             log::warn!(
                 target: TARGET, 
-                "Timeout on query in RLDP transfer {} to {}", 
+                "Timeout ({} ms) on query in RLDP transfer {} to {}",
+                timeout,
                 base64::encode(&transfer_id),
                 peers.other()
             );
-            return Ok(None);
+            return Ok((None, timeout));
         }
-        let start = Instant::now();
         let mut start_part = Instant::now();
         let mut updates = recv_state.updates();
-        loop {             
-            tokio::time::delay_for(Duration::new(0, Self::SPINNER)).await;
+        loop {
+            tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
             let new_updates = recv_state.updates();
             if new_updates > updates {
                 log::trace!(
@@ -826,23 +819,16 @@ impl RldpNode {
                     "Recv updates {} -> {} in transfer {}", 
                     updates, new_updates, base64::encode(&transfer_id)
                 );
+                timeout = Self::update_timeout(timeout, &start_part);
                 updates = new_updates;
                 start_part = Instant::now();
-            } else if start_part.elapsed().as_millis() as u64 > timeout_adnl {
+            } else if Self::is_timed_out(timeout, updates, &start_part) {
                 log::warn!(
                     target: TARGET, 
-                    "No activity for transfer {} to {}, aborting", 
+                    "No activity for transfer {} to {} in {} ms, aborting", 
                     base64::encode(&transfer_id),
-                    peers.other()
-                );
-                break
-            }                
-            if start.elapsed().as_millis() as u64 > timeout_rldp {
-                log::warn!(
-                    target: TARGET, 
-                    "No reply for transfer {} to {}, aborting", 
-                    base64::encode(&transfer_id),
-                    peers.other()
+                    peers.other(),
+                    timeout
                 );
                 break
             }
@@ -853,10 +839,11 @@ impl RldpNode {
                     base64::encode(&transfer_id),
                     peers.other()
                 );
-                return Ok(Some(reply.data))
+                timeout = Self::update_timeout(timeout, &start_part);
+                return Ok((Some(reply.data), timeout))
             }
         }
-        Ok(None)
+        Ok((None, timeout))
     }
 
     async fn receive_loop(
@@ -908,12 +895,7 @@ impl RldpNode {
         }
     }
 
-    async fn send_loop(
-        mut context: RldpSendContext<'_>, 
-        timeout_adnl: u64,
-        timeout_rldp: u64
-    ) -> Result<bool> {
-        let start = Instant::now();
+    async fn send_loop(mut context: RldpSendContext<'_>, mut timeout: u64) -> Result<(bool, u64)> {
         loop {
             if !context.send_transfer.start_next_part()? {
                 break;
@@ -928,7 +910,7 @@ impl RldpNode {
                         &context.peers
                     ).await?;
                 }                                                                                                                         
-                tokio::time::delay_for(Duration::new(0, Self::SPINNER)).await;
+                tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
                 if context.send_transfer.is_finished() {
                     break;
                 }
@@ -939,22 +921,25 @@ impl RldpNode {
                         "Send updates {} -> {} in transfer {}", 
                         recv_seqno, new_recv_seqno, base64::encode(&context.transfer_id)
                     );
+                    timeout = Self::update_timeout(timeout, &start_part);
                     recv_seqno = new_recv_seqno;
                     start_part = Instant::now();
-                } else if start_part.elapsed().as_millis() as u64 > timeout_adnl {
-                    return Ok(false)
+                } else if Self::is_timed_out(timeout, recv_seqno, &start_part) {
+                    return Ok((false, timeout))
                 }                
-                if start.elapsed().as_millis() as u64 > timeout_rldp {
-                    return Ok(false)
-                }
                 match context.send_transfer.state.part() {
                     x if x == part => continue,
                     x if x == part + 1 => break,
                     _ => fail!("INTERNAL ERROR: part # mismatch")
                 }
             }
+            timeout = Self::update_timeout(timeout, &start_part);
         }
-        Ok(true)
+        Ok((true, timeout))
+    }
+
+    fn update_timeout(timeout: u64, start: &Instant) -> u64{
+        (timeout + start.elapsed().as_millis() as u64) / 2
     }
 
 }
