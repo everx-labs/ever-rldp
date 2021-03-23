@@ -468,8 +468,9 @@ pub struct RldpNode {
 
 impl RldpNode {
 
-    const SPINNER: u64 = 10;       // Milliseconds
-    const TIMEOUT: u64 = 10000;    // Milliseconds
+    const SPINNER: u64 = 10;           // Milliseconds
+    const TIMEOUT_MAX: u64 = 10000;    // Milliseconds
+    const TIMEOUT_MIN: u64 = 500;      // Milliseconds
 
     /// Constructor 
     pub fn with_adnl_node(
@@ -494,77 +495,30 @@ impl RldpNode {
         peers: &AdnlPeers,
         roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {
-        let query_id: QueryId = rand::thread_rng().gen();
-        let message = RldpQuery {
-            query_id: ton::int256(query_id.clone()),
-            max_answer_size: max_answer_size.unwrap_or(128 * 1024),
-            timeout: Version::get() + Self::TIMEOUT as i32/1000,
-            data: ton::bytes(data.to_vec())
-        }.into_boxed();
-        let msg = serialize(&message)?;
-        let peer = if let Some(peer) = self.peers.get(peers.other()) {
-            peer
-        } else {
-            add_object_to_map(
-                &self.peers, 
-                peers.other().clone(),
-                || {
-                    let ret = RldpPeer {
-                        queries: AtomicU32::new(0),
-                        queue: lockfree::queue::Queue::new()
-                    };
-                    Ok(ret)
-                }
-            )?;
-            if let Some(peer) = self.peers.get(peers.other()) {
-                peer
-            } else {
-                fail!("Cannot find RLDP peer {}", peers.other())
-            }           
-        };
-        let peer = peer.val();
-        if peer.queries.fetch_add(1, Ordering::Relaxed) != 0 {
-            let ping = Arc::new(tokio::sync::Barrier::new(2));
-            peer.queue.push(ping.clone());
-            ping.wait().await;
-        }                                                 	
-        let all = RldpStats::inc(&self.stats.transfers_sent_all);
-        let now = RldpStats::inc(&self.stats.transfers_sent_now);
-        log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
-        let res = self.query_transfer(&msg, peers, Self::calc_timeout(roundtrip)).await;
-        let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
-        let now = RldpStats::dec(&self.stats.transfers_sent_now);
-        log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
-        if peer.queries.fetch_sub(1, Ordering::Relaxed) > 1 {
-            loop {
-                if let Some(pong) = peer.queue.pop() {
-                    pong.wait().await;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
-            }
+        #[cfg(feature = "trace")]
+        let tag = Self::fetch_tag(data);
+        let ret = self.query_transfer(
+            data, max_answer_size, peers, Self::calc_timeout(roundtrip)
+        ).await;
+        #[cfg(feature = "trace")]
+        match &ret {
+            Err(e) => log::info!(
+                target: TARGET, 
+                "RLDP STAT recv: failed {:x} from {}: {}", 
+                tag, peers.other(), e
+            ),
+            Ok((Some(data), _)) => log::info!(
+                target: TARGET, 
+                "RLDP STAT recv: success {:x} from {}: {} bytes", 
+                tag, peers.other(), data.len()
+            ),
+            Ok((None, _)) => log::info!(
+                target: TARGET, 
+                "RLDP STAT recv: no data {:x} from {}", 
+                tag, peers.other()
+            )
         }
-        let (answer, roundtrip) = res?;
-        if let Some(answer) = answer {
-            match deserialize(&answer[..])?.downcast::<RldpMessageBoxed>() {
-                Ok(RldpMessageBoxed::Rldp_Answer(answer)) => if answer.query_id.0 != query_id {
-                    fail!("Unknown query ID in RLDP answer")
-                } else {
-                    log::trace!(
-                        target: TARGET, 
-                        "RLDP answer {:02x}{:02x}{:02x}{:02x}...", 
-                        answer.data[0], answer.data[1], answer.data[2], answer.data[3]
-                    );
-                    Ok((Some(answer.data.to_vec()), roundtrip))
-                },
-                Ok(answer) => 
-                    fail!("Unexpected answer to RLDP query: {:?}", answer),
-                Err(answer) => 
-                    fail!("Unexpected answer to RLDP query: {:?}", answer)
-            }
-        } else {
-            Ok((None, roundtrip))
-        }        
+        ret
     }
 
     fn answer_transfer(
@@ -615,7 +569,7 @@ impl RldpNode {
                 let all = stats.transfers_recv_all.load(Ordering::Relaxed);
                 let now = RldpStats::dec(&stats.transfers_recv_now);
                 log::trace!(target: TARGET, "RLDP recv stats: all {}, now {}", all, now);
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT * 2)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX * 2)).await;
                 if let Some(send_transfer_id) = send_transfer_id {
                     transfers.remove(&send_transfer_id);
                 }
@@ -626,7 +580,7 @@ impl RldpNode {
         let transfer_id = transfer_id.clone();
         tokio::spawn(
             async move {
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX)).await;
                 transfers.insert(transfer_id, RldpTransfer::Done);
             }
         );
@@ -645,6 +599,8 @@ impl RldpNode {
             Ok(message) => fail!("Unexpected RLDP message: {:?}", message),
             Err(object) => fail!("Unexpected RLDP message: {:?}", object)
         };
+        #[cfg(feature = "trace")]
+        let tag = Self::fetch_tag(&query.data[..]);
         let answer = if let (true, answer) = Query::process_rldp(
             &subscribers, 
             &query, 
@@ -691,20 +647,49 @@ impl RldpNode {
                 "RLDP answer sent in transfer {} to {}",
                 base64::encode(&context.transfer_id),
                 context.peers.other()  
-            )
+            );
+            #[cfg(feature = "trace")]
+            log::info!(
+                target: TARGET, 
+                "RLDP STAT send: answer on {:x} sent in transfer {} to {}",
+                tag,
+                base64::encode(&context.transfer_id),
+                context.peers.other()  
+            );
         } else {
             log::warn!(
                 target: TARGET, 
                 "Timeout on answer in RLDP transfer {} to {}", 
                 base64::encode(&context.transfer_id),
                 context.peers.other()  
-            ) 
+            );
+            #[cfg(feature = "trace")]
+            log::info!(
+                target: TARGET, 
+                "RLDP STAT send: answer on {:x} timed out in transfer {} to {}",
+                tag,
+                base64::encode(&context.transfer_id),
+                context.peers.other()  
+            );
         }
         Ok(Some(send_transfer_id))
     }
 
     fn calc_timeout(roundtrip: Option<u64>) -> u64 {
-        max(roundtrip.unwrap_or(Self::TIMEOUT), Self::SPINNER * 2)
+        max(roundtrip.unwrap_or(Self::TIMEOUT_MAX), Self::TIMEOUT_MIN)
+    }
+
+    fn fetch_tag(data: &[u8]) -> u32 {
+        if data.len() >= 4 {
+            let mut tag = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            // Uncover Overlay.Query internal message if possible
+            if (tag == 0xCCFD8443) && (data.len() >= 40) {
+                tag = u32::from_le_bytes([data[36], data[37], data[38], data[39]]);
+            }
+            tag
+        } else {
+            0
+        }
     }
 
     fn is_timed_out(timeout: u64, updates: u32, start: &Instant) -> bool {
@@ -714,10 +699,48 @@ impl RldpNode {
     async fn query_transfer(
         &self, 
         data: &[u8],
+        max_answer_size: Option<i64>,
         peers: &AdnlPeers,
         timeout: u64
     ) -> Result<(Option<Vec<u8>>, u64)> {  
-        let send_transfer = SendTransfer::new(data, None);
+        let query_id: QueryId = rand::thread_rng().gen();
+        let message = RldpQuery {
+            query_id: ton::int256(query_id.clone()),
+            max_answer_size: max_answer_size.unwrap_or(128 * 1024),
+            timeout: Version::get() + Self::TIMEOUT_MAX as i32/1000,
+            data: ton::bytes(data.to_vec())
+        }.into_boxed();
+        let data = serialize(&message)?;
+        let peer = if let Some(peer) = self.peers.get(peers.other()) {
+            peer
+        } else {
+            add_object_to_map(
+                &self.peers, 
+                peers.other().clone(),
+                || {
+                    let ret = RldpPeer {
+                        queries: AtomicU32::new(0),
+                        queue: lockfree::queue::Queue::new()
+                    };
+                    Ok(ret)
+                }
+            )?;
+            if let Some(peer) = self.peers.get(peers.other()) {
+                peer
+            } else {
+                fail!("Cannot find RLDP peer {}", peers.other())
+            }           
+        };
+        let peer = peer.val();
+        if peer.queries.fetch_add(1, Ordering::Relaxed) != 0 {
+            let ping = Arc::new(tokio::sync::Barrier::new(2));
+            peer.queue.push(ping.clone());
+            ping.wait().await;
+        }                                                 	
+        let all = RldpStats::inc(&self.stats.transfers_sent_all);
+        let now = RldpStats::inc(&self.stats.transfers_sent_now);
+        log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
+        let send_transfer = SendTransfer::new(&data[..], None);
         let send_transfer_id = send_transfer.message.transfer_id().0.clone();
         self.transfers.insert(
             send_transfer_id.clone(), 
@@ -753,22 +776,54 @@ impl RldpNode {
             base64::encode(&recv_transfer_id), 
             data.len()
         );
-        let ret = self
+        let res = self
             .query_transfer_loop(send_context, recv_context, timeout)
             .await;
-        if ret.is_err() {
+        if res.is_err() {
             self.transfers.insert(send_transfer_id, RldpTransfer::Done);
         }
         self.transfers.insert(recv_transfer_id, RldpTransfer::Done);
         let transfers = self.transfers.clone();
         tokio::spawn(
             async move {
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT * 2)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX * 2)).await;
                 transfers.remove(&send_transfer_id); 
                 transfers.remove(&recv_transfer_id); 
             }
         );        
-        ret
+        let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
+        let now = RldpStats::dec(&self.stats.transfers_sent_now);
+        log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
+        if peer.queries.fetch_sub(1, Ordering::Relaxed) > 1 {
+            loop {
+                if let Some(pong) = peer.queue.pop() {
+                    pong.wait().await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
+            }
+        }
+        let (answer, roundtrip) = res?;
+        if let Some(answer) = answer {
+            match deserialize(&answer[..])?.downcast::<RldpMessageBoxed>() {
+                Ok(RldpMessageBoxed::Rldp_Answer(answer)) => if answer.query_id.0 != query_id {
+                    fail!("Unknown query ID in RLDP answer")
+                } else {
+                    log::trace!(
+                        target: TARGET, 
+                        "RLDP answer {:02x}{:02x}{:02x}{:02x}...", 
+                        answer.data[0], answer.data[1], answer.data[2], answer.data[3]
+                    );
+                    Ok((Some(answer.data.to_vec()), roundtrip))
+                },
+                Ok(answer) => 
+                    fail!("Unexpected answer to RLDP query: {:?}", answer),
+                Err(answer) => 
+                    fail!("Unexpected answer to RLDP query: {:?}", answer)
+            }
+        } else {
+            Ok((None, roundtrip))
+        }        
     }
 
     async fn query_transfer_loop(
@@ -914,6 +969,11 @@ impl RldpNode {
                 if context.send_transfer.is_finished() {
                     break;
                 }
+                match context.send_transfer.state.part() {
+                    x if x == part => (),
+                    x if x == part + 1 => break,
+                    _ => fail!("INTERNAL ERROR: part # mismatch")
+                }
                 let new_recv_seqno = context.send_transfer.state.seqno_recv();
                 if new_recv_seqno > recv_seqno {
                     log::trace!(
@@ -925,13 +985,8 @@ impl RldpNode {
                     recv_seqno = new_recv_seqno;
                     start_part = Instant::now();
                 } else if Self::is_timed_out(timeout, recv_seqno, &start_part) {
-                    return Ok((false, timeout))
+                    return Ok((false, min(timeout * 2, Self::TIMEOUT_MAX)))
                 }                
-                match context.send_transfer.state.part() {
-                    x if x == part => continue,
-                    x if x == part + 1 => break,
-                    _ => fail!("INTERNAL ERROR: part # mismatch")
-                }
             }
             timeout = Self::update_timeout(timeout, &start_part);
         }
@@ -981,6 +1036,24 @@ impl Subscriber for RldpNode {
                         if let RldpTransfer::Recv(queue_sender) = transfer.val() {   
                             queue_sender.send(msg)
                         } else {
+                            let reply = RldpConfirm {
+                                transfer_id: msg.transfer_id,
+                                part: msg.part,
+                                seqno: msg.seqno
+                            }.into_boxed();
+                            let reply = serialize(&reply)?;
+                            self.adnl.send_custom(&reply[..], peers).await?;
+                            let reply = RldpComplete {
+                                transfer_id: msg.transfer_id,
+                                part: msg.part
+                            }.into_boxed();
+                            let reply = serialize(&reply)?;
+                            self.adnl.send_custom(&reply[..], peers).await?;
+                            log::info!(
+                                target: TARGET, 
+                                "Receive update on closed RLDP transfer {}, part {}, seqno {}", 
+                                base64::encode(transfer_id), msg.part, msg.seqno
+                            );
                             break
                         }
                     } else {
