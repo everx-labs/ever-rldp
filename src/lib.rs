@@ -497,9 +497,7 @@ impl RldpNode {
     ) -> Result<(Option<Vec<u8>>, u64)> {
         #[cfg(feature = "trace")]
         let tag = Self::fetch_tag(data);
-        let ret = self.query_transfer(
-            data, max_answer_size, peers, Self::calc_timeout(roundtrip)
-        ).await;
+        let ret = self.query_transfer(data, max_answer_size, peers, roundtrip).await;
         #[cfg(feature = "trace")]
         match &ret {
             Err(e) => log::info!(
@@ -641,7 +639,7 @@ impl RldpNode {
             send_transfer,
             transfer_id: context.transfer_id.clone()
         };
-        if let (true, _) = Self::send_loop(context_send, Self::calc_timeout(None)).await? {
+        if let (true, _) = Self::send_loop(context_send, None).await? {
             log::trace!(
                 target: TARGET, 
                 "RLDP answer sent in transfer {} to {}",
@@ -679,6 +677,7 @@ impl RldpNode {
         max(roundtrip.unwrap_or(Self::TIMEOUT_MAX), Self::TIMEOUT_MIN)
     }
 
+    #[cfg(feature = "trace")]
     fn fetch_tag(data: &[u8]) -> u32 {
         if data.len() >= 4 {
             let mut tag = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -701,8 +700,9 @@ impl RldpNode {
         data: &[u8],
         max_answer_size: Option<i64>,
         peers: &AdnlPeers,
-        timeout: u64
+        roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {  
+        const MAX_QUERIES: u32 = 3;
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
             query_id: ton::int256(query_id.clone()),
@@ -732,7 +732,7 @@ impl RldpNode {
             }           
         };
         let peer = peer.val();
-        if peer.queries.fetch_add(1, Ordering::Relaxed) != 0 {
+        if peer.queries.fetch_add(1, Ordering::Relaxed) >= MAX_QUERIES {
             let ping = Arc::new(tokio::sync::Barrier::new(2));
             peer.queue.push(ping.clone());
             ping.wait().await;
@@ -777,7 +777,7 @@ impl RldpNode {
             data.len()
         );
         let res = self
-            .query_transfer_loop(send_context, recv_context, timeout)
+            .query_transfer_loop(send_context, recv_context, roundtrip)
             .await;
         if res.is_err() {
             self.transfers.insert(send_transfer_id, RldpTransfer::Done);
@@ -794,13 +794,13 @@ impl RldpNode {
         let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
         let now = RldpStats::dec(&self.stats.transfers_sent_now);
         log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
-        if peer.queries.fetch_sub(1, Ordering::Relaxed) > 1 {
+        if peer.queries.fetch_sub(1, Ordering::Relaxed) > MAX_QUERIES {
             loop {
                 if let Some(pong) = peer.queue.pop() {
                     pong.wait().await;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
+                tokio::task::yield_now().await;
             }
         }
         let (answer, roundtrip) = res?;
@@ -830,7 +830,7 @@ impl RldpNode {
         &self, 
         send_context: RldpSendContext<'_>, 
         mut recv_context: RldpRecvContext, 
-        timeout: u64,
+        roundtrip: Option<u64>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
         let ping = Arc::new(lockfree::queue::Queue::new());
         let pong = ping.clone();
@@ -844,7 +844,8 @@ impl RldpNode {
                 pong.push(recv_context.recv_transfer)
             }
         );
-        let (ok, mut timeout) = Self::send_loop(send_context, timeout).await?;
+        let (ok, mut roundtrip) = Self::send_loop(send_context, roundtrip).await?;
+        let mut timeout = Self::calc_timeout(Some(roundtrip));
         self.transfers.insert(transfer_id.clone(), RldpTransfer::Done);
         if ok {
             log::trace!(
@@ -861,7 +862,7 @@ impl RldpNode {
                 base64::encode(&transfer_id),
                 peers.other()
             );
-            return Ok((None, timeout));
+            return Ok((None, roundtrip));
         }
         let mut start_part = Instant::now();
         let mut updates = recv_state.updates();
@@ -874,7 +875,7 @@ impl RldpNode {
                     "Recv updates {} -> {} in transfer {}", 
                     updates, new_updates, base64::encode(&transfer_id)
                 );
-                timeout = Self::update_timeout(timeout, &start_part);
+                timeout = Self::update_roundtrip(&mut roundtrip, &start_part);
                 updates = new_updates;
                 start_part = Instant::now();
             } else if Self::is_timed_out(timeout, updates, &start_part) {
@@ -894,11 +895,11 @@ impl RldpNode {
                     base64::encode(&transfer_id),
                     peers.other()
                 );
-                timeout = Self::update_timeout(timeout, &start_part);
-                return Ok((Some(reply.data), timeout))
+                Self::update_roundtrip(&mut roundtrip, &start_part);
+                return Ok((Some(reply.data), roundtrip))
             }
         }
-        Ok((None, timeout))
+        Ok((None, roundtrip))
     }
 
     async fn receive_loop(
@@ -950,7 +951,12 @@ impl RldpNode {
         }
     }
 
-    async fn send_loop(mut context: RldpSendContext<'_>, mut timeout: u64) -> Result<(bool, u64)> {
+    async fn send_loop(
+        mut context: RldpSendContext<'_>, 
+        roundtrip: Option<u64>
+    ) -> Result<(bool, u64)> {
+        let mut timeout = Self::calc_timeout(roundtrip);
+        let mut roundtrip = roundtrip.unwrap_or(0);
         loop {
             if !context.send_transfer.start_next_part()? {
                 break;
@@ -981,20 +987,25 @@ impl RldpNode {
                         "Send updates {} -> {} in transfer {}", 
                         recv_seqno, new_recv_seqno, base64::encode(&context.transfer_id)
                     );
-                    timeout = Self::update_timeout(timeout, &start_part);
+                    timeout = Self::update_roundtrip(&mut roundtrip, &start_part);
                     recv_seqno = new_recv_seqno;
                     start_part = Instant::now();
                 } else if Self::is_timed_out(timeout, recv_seqno, &start_part) {
-                    return Ok((false, min(timeout * 2, Self::TIMEOUT_MAX)))
+                    return Ok((false, min(roundtrip * 2, Self::TIMEOUT_MAX)))
                 }                
             }
-            timeout = Self::update_timeout(timeout, &start_part);
+            timeout = Self::update_roundtrip(&mut roundtrip, &start_part);
         }
-        Ok((true, timeout))
+        Ok((true, roundtrip))
     }
 
-    fn update_timeout(timeout: u64, start: &Instant) -> u64{
-        (timeout + start.elapsed().as_millis() as u64) / 2
+    fn update_roundtrip(roundtrip: &mut u64, start: &Instant) -> u64{
+        *roundtrip = if *roundtrip == 0 {
+            start.elapsed().as_millis() as u64
+        } else {
+            (*roundtrip + start.elapsed().as_millis() as u64) / 2
+        };
+        Self::calc_timeout(Some(*roundtrip)) 
     }
 
 }
