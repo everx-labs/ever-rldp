@@ -8,9 +8,11 @@ use adnl::{
 };
 use rand::Rng;
 use std::{
-    cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, 
+    cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}}, 
     time::{Duration, Instant}
 };
+#[cfg(feature = "telemetry")]
+use std::sync::atomic::AtomicU64; 
 use ton_api::{
     IntoBoxed, 
     ton::{
@@ -313,6 +315,18 @@ impl <'a> SendTransfer<'a> {
         ((self.state.part() as usize + 1) * Self::SLICE >= self.data.len())
     }
 
+    fn is_finished_or_next_part(&self, part: u32) -> Result<bool> {
+        if self.is_finished() {
+            Ok(true)
+        } else {
+            match self.state.part() {
+                x if x == part => Ok(false),
+                x if x == part + 1 => Ok(true),
+                 _ => fail!("INTERNAL ERROR: part # mismatch")
+            }
+        }
+    }
+
     fn message(&mut self) -> Result<&mut RldpMessagePart> {
         match self.message { 
             RldpMessagePartBoxed::Rldp_MessagePart(ref mut msg) => Ok(msg),
@@ -342,15 +356,15 @@ impl <'a> SendTransfer<'a> {
         }
     }
 
-    fn start_next_part(&mut self) -> Result<bool> {
+    fn start_next_part(&mut self) -> Result<u32> {
         if self.is_finished() {
-           return Ok(false);
+           return Ok(0);
         }
         let part = self.state.part() as usize;
         let processed = part * Self::SLICE;
         let total = self.data.len();
         if processed >= total {
-           return Ok(false);
+           return Ok(0);
         }
         let chunk_size = min(total - processed, Self::SLICE);
         let encoder = RaptorqEncoder::with_data(
@@ -359,15 +373,16 @@ impl <'a> SendTransfer<'a> {
         let message = self.message()?;
         message.part = part as i32;
         message.total_size = total as i64;
+        let ret = encoder.params.symbols_count;
         match message.fec_type {
             FecType::Fec_RaptorQ(ref mut fec_type) => {
                 fec_type.data_size = encoder.params.data_size;      
-                fec_type.symbols_count = encoder.params.symbols_count;
+                fec_type.symbols_count = ret;
             },
             _ => fail!("INTERNAL ERROR: unsupported FEC type")
         }
         self.encoder = Some(encoder);
-        Ok(true)
+        Ok(ret as u32)
     }
 
 }
@@ -435,6 +450,7 @@ struct RldpSendContext<'a> {
     transfer_id: TransferId
 }
 
+#[cfg(feature = "telemetry")]
 #[derive(Default)]
 struct RldpStats {
     transfers_sent_all: AtomicU64,
@@ -443,6 +459,7 @@ struct RldpStats {
     transfers_recv_now: AtomicU64
 }
 
+#[cfg(feature = "telemetry")]
 impl RldpStats {
     fn inc(stat: &AtomicU64) -> u64 {
         stat.fetch_add(1, Ordering::Relaxed) + 1
@@ -461,6 +478,7 @@ struct RldpPeer {
 pub struct RldpNode {
     adnl: Arc<AdnlNode>,
     peers: lockfree::map::Map<Arc<KeyId>, RldpPeer>,
+    #[cfg(feature = "telemetry")]
     stats: Arc<RldpStats>,
     subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
     transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>
@@ -468,10 +486,13 @@ pub struct RldpNode {
 
 impl RldpNode {
 
+    const MAX_QUERIES: u32 = 3;
+    const SIZE_TRANSFER_WAVE: u32 = 10;
     const SPINNER: u64 = 10;           // Milliseconds
     const TIMEOUT_MAX: u64 = 10000;    // Milliseconds
     const TIMEOUT_MIN: u64 = 500;      // Milliseconds
-
+    const TIMEOUT_TELEMETRY: u64 = 10; // Seconds
+    
     /// Constructor 
     pub fn with_adnl_node(
         adnl: Arc<AdnlNode>, 
@@ -480,6 +501,7 @@ impl RldpNode {
         let ret = Self {
             adnl,
             peers: lockfree::map::Map::new(), 
+            #[cfg(feature = "telemetry")]
             stats: Arc::new(RldpStats::default()),
             subscribers: Arc::new(subscribers),
             transfers: Arc::new(lockfree::map::Map::new())
@@ -495,10 +517,10 @@ impl RldpNode {
         peers: &AdnlPeers,
         roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {
-        #[cfg(feature = "trace")]
+        #[cfg(feature = "telemetry")]
         let tag = Self::fetch_tag(data);
         let ret = self.query_transfer(data, max_answer_size, peers, roundtrip).await;
-        #[cfg(feature = "trace")]
+        #[cfg(feature = "telemetry")]
         match &ret {
             Err(e) => log::info!(
                 target: TARGET, 
@@ -533,9 +555,12 @@ impl RldpNode {
         if !inserted {
             return Ok(None)
         }
+        #[cfg(feature = "telemetry")]
         let all = RldpStats::inc(&self.stats.transfers_recv_all);
+        #[cfg(feature = "telemetry")]
         let now = RldpStats::inc(&self.stats.transfers_recv_now);
-        log::trace!(target: TARGET, "RLDP recv stats: all {}, now {}", all, now);
+        #[cfg(feature = "telemetry")]
+        log::trace!(target: TARGET, "RLDP STAT recv: transfers total {}, active {}", all, now);
         let mut context = RldpRecvContext {
             adnl: self.adnl.clone(),
             peers: peers.clone(),
@@ -543,6 +568,7 @@ impl RldpNode {
             recv_transfer: RecvTransfer::new(transfer_id.clone()),
             transfer_id: transfer_id.clone()
         };
+        #[cfg(feature = "telemetry")]
         let stats = self.stats.clone();
         let subscribers = self.subscribers.clone();
         let transfers = self.transfers.clone();
@@ -564,9 +590,12 @@ impl RldpNode {
                         None
                     },
                 );    
+                #[cfg(feature = "telemetry")]
                 let all = stats.transfers_recv_all.load(Ordering::Relaxed);
+                #[cfg(feature = "telemetry")]
                 let now = RldpStats::dec(&stats.transfers_recv_now);
-                log::trace!(target: TARGET, "RLDP recv stats: all {}, now {}", all, now);
+                #[cfg(feature = "telemetry")]
+                log::trace!(target: TARGET, "RLDP STAT recv: transfers total {}, active {}", all, now);
                 tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX * 2)).await;
                 if let Some(send_transfer_id) = send_transfer_id {
                     transfers.remove(&send_transfer_id);
@@ -597,7 +626,7 @@ impl RldpNode {
             Ok(message) => fail!("Unexpected RLDP message: {:?}", message),
             Err(object) => fail!("Unexpected RLDP message: {:?}", object)
         };
-        #[cfg(feature = "trace")]
+        #[cfg(feature = "telemetry")]
         let tag = Self::fetch_tag(&query.data[..]);
         let answer = if let (true, answer) = Query::process_rldp(
             &subscribers, 
@@ -646,7 +675,7 @@ impl RldpNode {
                 base64::encode(&context.transfer_id),
                 context.peers.other()  
             );
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             log::info!(
                 target: TARGET, 
                 "RLDP STAT send: answer on {:x} sent in transfer {} to {}",
@@ -661,7 +690,7 @@ impl RldpNode {
                 base64::encode(&context.transfer_id),
                 context.peers.other()  
             );
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             log::info!(
                 target: TARGET, 
                 "RLDP STAT send: answer on {:x} timed out in transfer {} to {}",
@@ -677,7 +706,7 @@ impl RldpNode {
         max(roundtrip.unwrap_or(Self::TIMEOUT_MAX), Self::TIMEOUT_MIN)
     }
 
-    #[cfg(feature = "trace")]
+    #[cfg(feature = "telemetry")]
     fn fetch_tag(data: &[u8]) -> u32 {
         if data.len() >= 4 {
             let mut tag = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -695,6 +724,9 @@ impl RldpNode {
         start.elapsed().as_millis() as u64 > timeout + timeout * updates as u64 / 100
     }
 
+    fn print_stats(&self) {
+    }
+
     async fn query_transfer(
         &self, 
         data: &[u8],
@@ -702,7 +734,6 @@ impl RldpNode {
         peers: &AdnlPeers,
         roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {  
-        const MAX_QUERIES: u32 = 3;
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
             query_id: ton::int256(query_id.clone()),
@@ -732,14 +763,24 @@ impl RldpNode {
             }           
         };
         let peer = peer.val();
-        if peer.queries.fetch_add(1, Ordering::Relaxed) >= MAX_QUERIES {
+        let queries = peer.queries.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "telemetry")]
+        log::trace!(
+            target: TARGET, 
+            "RLDP STAT send: peer {} queries queued: {}", 
+            peers.other(), queries
+        );
+        if queries >= Self::MAX_QUERIES {
             let ping = Arc::new(tokio::sync::Barrier::new(2));
             peer.queue.push(ping.clone());
             ping.wait().await;
         }                                                 	
+        #[cfg(feature = "telemetry")]
         let all = RldpStats::inc(&self.stats.transfers_sent_all);
+        #[cfg(feature = "telemetry")]
         let now = RldpStats::inc(&self.stats.transfers_sent_now);
-        log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
+        #[cfg(feature = "telemetry")]
+        log::trace!(target: TARGET, "RLDP STAT send: transfers total {}, active {}", all, now);
         let send_transfer = SendTransfer::new(&data[..], None);
         let send_transfer_id = send_transfer.message.transfer_id().0.clone();
         self.transfers.insert(
@@ -791,10 +832,20 @@ impl RldpNode {
                 transfers.remove(&recv_transfer_id); 
             }
         );        
+        #[cfg(feature = "telemetry")]
         let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
+        #[cfg(feature = "telemetry")]
         let now = RldpStats::dec(&self.stats.transfers_sent_now);
-        log::trace!(target: TARGET, "RLDP send stats: all {}, now {}", all, now);
-        if peer.queries.fetch_sub(1, Ordering::Relaxed) > MAX_QUERIES {
+        #[cfg(feature = "telemetry")]
+        log::trace!(target: TARGET, "RLDP STAT send: transfers total {}, actual {}", all, now);
+        let queries = peer.queries.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "telemetry")]
+        log::trace!(
+            target: TARGET, 
+            "RLDP STAT send: peer {} queries queued: {}", 
+            peers.other(), queries
+        );
+        if queries > Self::MAX_QUERIES {
             loop {
                 if let Some(pong) = peer.queue.pop() {
                     pong.wait().await;
@@ -958,27 +1009,27 @@ impl RldpNode {
         let mut timeout = Self::calc_timeout(roundtrip);
         let mut roundtrip = roundtrip.unwrap_or(0);
         loop {
-            if !context.send_transfer.start_next_part()? {
+            let mut transfer_wave = context.send_transfer.start_next_part()?;
+            if transfer_wave == 0 {
                 break;
             }
+            transfer_wave = min(transfer_wave, Self::SIZE_TRANSFER_WAVE);
             let part = context.send_transfer.state.part();
             let mut start_part = Instant::now();
             let mut recv_seqno = 0;
-            loop {                            
-                for _ in 0..10 {
+            'part: loop {                            
+                for _ in 0..transfer_wave {
                     context.adnl.send_custom(
                         context.send_transfer.prepare_chunk()?, 
                         &context.peers
                     ).await?;
+                    if context.send_transfer.is_finished_or_next_part(part)? {
+                        break 'part;
+                    }
                 }                                                                                                                         
                 tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
-                if context.send_transfer.is_finished() {
+                if context.send_transfer.is_finished_or_next_part(part)? {
                     break;
-                }
-                match context.send_transfer.state.part() {
-                    x if x == part => (),
-                    x if x == part + 1 => break,
-                    _ => fail!("INTERNAL ERROR: part # mismatch")
                 }
                 let new_recv_seqno = context.send_transfer.state.seqno_recv();
                 if new_recv_seqno > recv_seqno {
@@ -1012,6 +1063,13 @@ impl RldpNode {
 
 #[async_trait::async_trait]
 impl Subscriber for RldpNode {
+
+    async fn poll(&self, start: &Arc<Instant>) {
+        if ((start.elapsed().as_secs() + 1) % Self::TIMEOUT_TELEMETRY) == 0 {
+            self.print_stats()
+        }
+    }
+
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
         let msg = if let Ok(msg) = deserialize(data) {
             msg
@@ -1084,4 +1142,5 @@ impl Subscriber for RldpNode {
         }
         Ok(true) 
     }
+
 }
