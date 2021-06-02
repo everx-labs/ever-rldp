@@ -141,21 +141,24 @@ impl RecvTransfer {
             self.data.reserve_exact(total_size);
             total_size
         };
-        let decoder = if let Some(decoder) = &mut self.decoder {
-            if self.part == message.part as u32 {
+        let decoder = if self.part == message.part as u32 {
+            if let Some(decoder) = &mut self.decoder {
                 if fec_type.as_ref() != &decoder.params {
-                    fail!("Incorrect parameters in RLDP packet")
+                    fail!(
+                        "Incorrect parameters in RLDP packet {:?} vs {:?}", 
+                        fec_type, decoder.params
+                    )
                 }
                 decoder
-            } else if self.part > message.part as u32 {
-                self.complete()?.part = message.part;
-                serialize_inplace(&mut self.buf, &self.complete)?;
-                return Ok(Some(&self.buf[..]));
             } else {
-                return Ok(None);
+                self.decoder.get_or_insert_with(|| RaptorqDecoder::with_params(*fec_type))
             }
+        } else if self.part > message.part as u32 {
+            self.complete()?.part = message.part;
+            serialize_inplace(&mut self.buf, &self.complete)?;
+            return Ok(Some(&self.buf[..]));
         } else {
-            self.decoder.get_or_insert_with(|| RaptorqDecoder::with_params(*fec_type))
+            return Ok(None);
         };
         if let Some(mut data) = decoder.decode(message.seqno as u32, &message.data) {
             if data.len() + self.data.len() > total_size {
@@ -650,13 +653,25 @@ impl RldpNode {
         for i in 0..send_transfer_id.len() {
             send_transfer_id[i] ^= 0xFF
         } 
-        log::trace!(
-            target: TARGET, 
-            "RLDP answer to be sent in transfer {}/{} to {}",
-            base64::encode(&context.transfer_id),
-            base64::encode(&send_transfer_id),
-            context.peers.other()  
-        );
+        let now = Version::get();
+        if now >= query.timeout {
+            log::warn!(
+                target: TARGET, 
+                "RLDP answer will be sent expired on {} sec in transfer {}/{} to {}",
+                now - query.timeout,
+                base64::encode(&context.transfer_id),
+                base64::encode(&send_transfer_id),
+                context.peers.other()  
+            )
+        } else {
+            log::trace!(
+                target: TARGET, 
+                "RLDP answer to be sent in transfer {}/{} to {}",
+                base64::encode(&context.transfer_id),
+                base64::encode(&send_transfer_id),
+                context.peers.other()  
+            )
+        }
         let send_transfer = SendTransfer::new(&data[..], Some(send_transfer_id.clone()));
         transfers.insert(
             send_transfer_id.clone(), 
@@ -818,7 +833,7 @@ impl RldpNode {
             data.len()
         );
         let res = self
-            .query_transfer_loop(send_context, recv_context, roundtrip)
+            .query_transfer_loop(send_context, recv_context, &recv_transfer_id, roundtrip)
             .await;
         if res.is_err() {
             self.transfers.insert(send_transfer_id, RldpTransfer::Done);
@@ -881,6 +896,7 @@ impl RldpNode {
         &self, 
         send_context: RldpSendContext<'_>, 
         mut recv_context: RldpRecvContext, 
+        recv_transfer_id: &TransferId,
         roundtrip: Option<u64>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
         let ping = Arc::new(lockfree::queue::Queue::new());
@@ -888,7 +904,7 @@ impl RldpNode {
         let peers = send_context.peers.clone();
         let recv_state = recv_context.recv_transfer.state.clone();
         let send_state = send_context.send_transfer.state.clone();
-        let transfer_id = send_context.transfer_id.clone();
+        let send_transfer_id = send_context.transfer_id.clone();
         tokio::spawn(
             async move {
                 Self::receive_loop(&mut recv_context, Some(send_state)).await;
@@ -897,20 +913,22 @@ impl RldpNode {
         );
         let (ok, mut roundtrip) = Self::send_loop(send_context, roundtrip).await?;
         let mut timeout = Self::calc_timeout(Some(roundtrip));
-        self.transfers.insert(transfer_id.clone(), RldpTransfer::Done);
+        self.transfers.insert(send_transfer_id.clone(), RldpTransfer::Done);
         if ok {
             log::trace!(
                 target: TARGET, 
-                "RLDP query sent in transfer {} to {}, waiting for answer",
-                base64::encode(&transfer_id),
+                "RLDP query sent in transfer {}/{} to {}, waiting for answer",
+                base64::encode(&send_transfer_id),
+                base64::encode(&recv_transfer_id),
                 peers.other()
             )
         } else {
             log::warn!(
                 target: TARGET, 
-                "Timeout ({} ms) on query in RLDP transfer {} to {}",
+                "Timeout ({} ms) on query in RLDP transfer {}/{} to {}",
                 timeout,
-                base64::encode(&transfer_id),
+                base64::encode(&send_transfer_id),
+                base64::encode(&recv_transfer_id),
                 peers.other()
             );
             return Ok((None, roundtrip));
@@ -923,8 +941,10 @@ impl RldpNode {
             if new_updates > updates {
                 log::trace!(
                     target: TARGET, 
-                    "Recv updates {} -> {} in transfer {}", 
-                    updates, new_updates, base64::encode(&transfer_id)
+                    "Recv updates {} -> {} in transfer {}/{}", 
+                    updates, new_updates, 
+                    base64::encode(&send_transfer_id),
+                    base64::encode(&recv_transfer_id)
                 );
                 timeout = Self::update_roundtrip(&mut roundtrip, &start_part);
                 updates = new_updates;
@@ -932,8 +952,9 @@ impl RldpNode {
             } else if Self::is_timed_out(timeout, updates, &start_part) {
                 log::warn!(
                     target: TARGET, 
-                    "No activity for transfer {} to {} in {} ms, aborting", 
-                    base64::encode(&transfer_id),
+                    "No activity for transfer {}/{} to {} in {} ms, aborting", 
+                    base64::encode(&send_transfer_id),
+                    base64::encode(&recv_transfer_id),
                     peers.other(),
                     timeout
                 );
@@ -942,8 +963,9 @@ impl RldpNode {
             if let Some(reply) = ping.pop() {
                 log::trace!(                  
                     target: TARGET, 
-                    "Got reply for transfer {} from {}", 
-                    base64::encode(&transfer_id),
+                    "Got reply for transfer {}/{} from {}", 
+                    base64::encode(&send_transfer_id),
+                    base64::encode(&recv_transfer_id),
                     peers.other()
                 );
                 Self::update_roundtrip(&mut roundtrip, &start_part);
@@ -960,10 +982,11 @@ impl RldpNode {
         while let Some(job) = context.queue_reader.recv().await {
             let begin = context.recv_transfer.data.len() == 0;
             match context.recv_transfer.process_chunk(job) {
-                Err(e) => log::warn!("RLDP error: {}", e),
-                Ok(Some(reply)) => match context.adnl.send_custom(reply, &context.peers).await {
-                    Err(e) => log::warn!("RLDP error: {}", e),
-                    _ => ()
+                Err(e) => log::warn!(target: TARGET, "RLDP error: {}", e),
+                Ok(Some(reply)) => {
+                    if let Err(e) = context.adnl.send_custom(reply, context.peers.clone()) {
+                        log::warn!(target: TARGET, "RLDP reply error: {}", e)
+                    }
                 },
                 _ => ()
             }
@@ -1021,8 +1044,8 @@ impl RldpNode {
                 for _ in 0..transfer_wave {
                     context.adnl.send_custom(
                         context.send_transfer.prepare_chunk()?, 
-                        &context.peers
-                    ).await?;
+                        context.peers.clone()
+                    )?;
                     if context.send_transfer.is_finished_or_next_part(part)? {
                         break 'part;
                     }
@@ -1111,13 +1134,13 @@ impl Subscriber for RldpNode {
                                 seqno: msg.seqno
                             }.into_boxed();
                             let reply = serialize(&reply)?;
-                            self.adnl.send_custom(&reply[..], peers).await?;
+                            self.adnl.send_custom(&reply[..], peers.clone())?;
                             let reply = RldpComplete {
                                 transfer_id: msg.transfer_id,
                                 part: msg.part
                             }.into_boxed();
                             let reply = serialize(&reply)?;
-                            self.adnl.send_custom(&reply[..], peers).await?;
+                            self.adnl.send_custom(&reply[..], peers.clone())?;
                             log::info!(
                                 target: TARGET, 
                                 "Receive update on closed RLDP transfer {}, part {}, seqno {}", 
