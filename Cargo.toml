@@ -2,7 +2,7 @@
 edition = "2018"
 build = "./common/build/build.rs"
 name = "rldp"
-version = "0.1.35"
+version = "0.2.10"
 description = "RLDP library"
 
 [dependencies]
@@ -12,11 +12,11 @@ failure = "0.1.6"
 log = "0.4.8"
 rand = "0.7.2"
 raptorq = { version = "1.2.1", path = "raptorq" }
-tokio = { version = "1.3.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.5.0", features = ["rt-multi-thread"] }
 
 lockfree = { git = "https://github.com/tonlabs/lockfree.git" }
 ton_api = { git = "https://github.com/tonlabs/ton-labs-tl.git", package = "ton_api" }
-adnl = { version = "0.1", git = "https://github.com/tonlabs/ton-labs-adnl", features = ["node"] }
+adnl = { git = "https://github.com/tonlabs/ton-labs-adnl", features = ["node"] }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
 
 [dev-dependencies]
@@ -24,7 +24,7 @@ arrayref = "0.3.5"
 external-ip = "4.1.0"
 hex = "^0"
 log4rs = "0.8.3"
-overlay = { version = "0.1", git = "https://github.com/tonlabs/ton-labs-overlay.git" }
+overlay = { git = "https://github.com/tonlabs/ton-labs-overlay.git" }
 serde_json = "1.0.41"
 sha2 = "0.8.0"
 
