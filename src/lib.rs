@@ -6,6 +6,8 @@ use adnl::{
     },
     node::AdnlNode
 };
+#[cfg(feature = "compression")]
+use adnl::node::DataCompression;
 use rand::Rng;
 use std::{
     cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}}, 
@@ -411,7 +413,7 @@ impl SendTransferState {
         self.seqno_sent.load(Ordering::Relaxed)
     }
     fn set_part(&self, part: u32) {
-        self.part.compare_and_swap(part - 1, part, Ordering::Relaxed);
+        self.part.compare_exchange(part - 1, part, Ordering::Relaxed, Ordering::Relaxed).ok();
     }
     fn set_reply(&self) {
         self.reply.store(true, Ordering::Relaxed)
@@ -420,14 +422,24 @@ impl SendTransferState {
         if self.seqno_sent() >= seqno {
             let seqno_recv = self.seqno_recv();
             if seqno_recv < seqno {
-                self.seqno_recv.compare_and_swap(seqno_recv, seqno, Ordering::Relaxed);
+                self.seqno_recv.compare_exchange(
+                    seqno_recv, 
+                    seqno, 
+                    Ordering::Relaxed, 
+                    Ordering::Relaxed
+                ).ok();
             }
         }
     }
     fn set_seqno_sent(&self, seqno: u32) {
         let seqno_sent = self.seqno_sent();
         if seqno_sent < seqno {
-            self.seqno_sent.compare_and_swap(seqno_sent, seqno, Ordering::Relaxed);
+            self.seqno_sent.compare_exchange(
+                seqno_sent, 
+                seqno, 
+                Ordering::Relaxed, 
+                Ordering::Relaxed
+            ).ok();
         }
     }
 }
@@ -622,12 +634,24 @@ impl RldpNode {
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
     ) -> Result<Option<TransferId>> { 
-        let query = match deserialize(
-            &context.recv_transfer.data[..]
-        )?.downcast::<RldpMessageBoxed>() {
-            Ok(RldpMessageBoxed::Rldp_Query(query)) => query,
-            Ok(message) => fail!("Unexpected RLDP message: {:?}", message),
-            Err(object) => fail!("Unexpected RLDP message: {:?}", object)
+
+        fn deserialize_query(context: &RldpRecvContext) -> Result<Box<RldpQuery>> {
+            match deserialize(
+               &context.recv_transfer.data[..]
+            )?.downcast::<RldpMessageBoxed>() {
+                Ok(RldpMessageBoxed::Rldp_Query(query)) => Ok(query),
+                Ok(message) => fail!("Unexpected RLDP message: {:?}", message),
+                Err(object) => fail!("Unexpected RLDP message: {:?}", object)
+            }
+        }
+
+        #[cfg(not(feature = "compression"))]
+        let query = deserialize_query(context)?;
+        #[cfg(feature = "compression")] 
+        let query = {
+            let mut query = deserialize_query(context)?;
+            query.data = ton::bytes(DataCompression::decompress(&query.data)?);
+            query
         };
         #[cfg(feature = "telemetry")]
         let tag = Self::fetch_tag(&query.data[..]);
@@ -636,11 +660,20 @@ impl RldpNode {
             &query, 
             &context.peers
         ).await? {
-            if let Some(answer) = answer {
+            #[cfg(not(feature = "compression"))] 
+            let answer = if let Some(answer) = answer {
                 answer
             } else {
                 return Ok(None)
-            }
+            };
+            #[cfg(feature = "compression")] 
+            let answer = if let Some(mut answer) = answer {
+                answer.data = ton::bytes(DataCompression::compress(&answer.data)?);
+                answer
+            } else {
+                return Ok(None)
+            }; 
+            answer
         } else {
             fail!("No subscribers for query {:?}", query)
         };
@@ -715,6 +748,7 @@ impl RldpNode {
             );
         }
         Ok(Some(send_transfer_id))
+
     }
 
     fn calc_timeout(roundtrip: Option<u64>) -> u64 {
@@ -749,12 +783,16 @@ impl RldpNode {
         peers: &AdnlPeers,
         roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {  
+        #[cfg(not(feature = "compression"))]
+        let data = data.to_vec();
+        #[cfg(feature = "compression")]
+        let data = DataCompression::compress(data)?;
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
             query_id: ton::int256(query_id.clone()),
             max_answer_size: max_answer_size.unwrap_or(128 * 1024),
             timeout: Version::get() + Self::TIMEOUT_MAX as i32/1000,
-            data: ton::bytes(data.to_vec())
+            data: ton::bytes(data)
         }.into_boxed();
         let data = serialize(&message)?;
         let peer = if let Some(peer) = self.peers.get(peers.other()) {
@@ -875,12 +913,16 @@ impl RldpNode {
                 Ok(RldpMessageBoxed::Rldp_Answer(answer)) => if answer.query_id.0 != query_id {
                     fail!("Unknown query ID in RLDP answer")
                 } else {
+                    #[cfg(not(feature = "compression"))]
+                    let data = answer.data.to_vec();
+                    #[cfg(feature = "compression")]
+                    let data = DataCompression::decompress(&answer.data)?;
                     log::trace!(
                         target: TARGET, 
                         "RLDP answer {:02x}{:02x}{:02x}{:02x}...", 
-                        answer.data[0], answer.data[1], answer.data[2], answer.data[3]
+                        data[0], data[1], data[2], data[3]
                     );
-                    Ok((Some(answer.data.to_vec()), roundtrip))
+                    Ok((Some(data), roundtrip))
                 },
                 Ok(answer) => 
                     fail!("Unexpected answer to RLDP query: {:?}", answer),
@@ -1143,7 +1185,7 @@ impl Subscriber for RldpNode {
                             self.adnl.send_custom(&reply[..], peers.clone())?;
                             log::info!(
                                 target: TARGET, 
-                                "Receive update on closed RLDP transfer {}, part {}, seqno {}", 
+                                "Receive update on closed RLDP transfer {}, part {}, seqno {}",
                                 base64::encode(transfer_id), msg.part, msg.seqno
                             );
                             break
