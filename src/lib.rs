@@ -2,10 +2,12 @@ use adnl::{
     dump, 
     common::{
         add_object_to_map, deserialize, get256, AdnlPeers, KeyId, Query, QueryId, serialize, 
-        serialize_inplace, Subscriber, Version
+        serialize_inplace, Subscriber, TaggedByteSlice, Version
     },
     node::AdnlNode
 };
+#[cfg(feature = "telemetry")]
+use adnl::common::{tag_from_object, tag_from_unboxed_type};
 #[cfg(feature = "compression")]
 use adnl::node::DataCompression;
 use rand::Rng;
@@ -82,23 +84,33 @@ struct RecvTransfer {
     decoder: Option<RaptorqDecoder>,
     part: u32,
     state: Arc<RecvTransferState>,
-    total_size: Option<usize>
+    total_size: Option<usize>,
+    #[cfg(feature = "telemetry")]
+    tag_complete: u32,
+    #[cfg(feature = "telemetry")]
+    tag_confirm: u32
 }
 
 impl RecvTransfer {
 
     fn new(transfer_id: TransferId) -> Self {
+        let complete = RldpComplete {
+            transfer_id: ton::int256(transfer_id.clone()),
+            part: 0
+        }.into_boxed();
+        #[cfg(feature = "telemetry")]
+        let tag_complete = tag_from_object(&complete);
+        let confirm = RldpConfirm {
+            transfer_id: ton::int256(transfer_id.clone()),
+            part: 0,
+            seqno: 0
+        }.into_boxed();
+        #[cfg(feature = "telemetry")]
+        let tag_confirm = tag_from_object(&confirm);
         Self { 
             buf: Vec::new(),
-            complete: RldpComplete {
-                transfer_id: ton::int256(transfer_id.clone()),
-                part: 0
-            }.into_boxed(),
-            confirm: RldpConfirm {
-                transfer_id: ton::int256(transfer_id.clone()),
-                part: 0,
-                seqno: 0
-            }.into_boxed(),
+            complete,
+            confirm,
             confirm_count: 0,
             data: Vec::new(),
             decoder: None,
@@ -108,7 +120,11 @@ impl RecvTransfer {
                     updates: AtomicU32::new(0)
                 }
             ),
-            total_size: None
+            total_size: None,
+            #[cfg(feature = "telemetry")]
+            tag_complete,
+            #[cfg(feature = "telemetry")]
+            tag_confirm
         }
     }
 
@@ -126,7 +142,7 @@ impl RecvTransfer {
         }
     }
 
-    fn process_chunk(&mut self, message: Box<RldpMessagePart>) -> Result<Option<&[u8]>> {
+    fn process_chunk(&mut self, message: Box<RldpMessagePart>) -> Result<Option<TaggedByteSlice>> {
         let fec_type = if let FecType::Fec_RaptorQ(fec_type) = message.fec_type {
             fec_type
         } else {
@@ -156,11 +172,9 @@ impl RecvTransfer {
                 self.decoder.get_or_insert_with(|| RaptorqDecoder::with_params(*fec_type))
             }
         } else if self.part > message.part as u32 {
-            self.complete()?.part = message.part;
-            serialize_inplace(&mut self.buf, &self.complete)?;
-            return Ok(Some(&self.buf[..]));
+            return self.build_part_completed_reply(message.part)
         } else {
-            return Ok(None);
+            return Ok(None)
         };
         if let Some(mut data) = decoder.decode(message.seqno as u32, &message.data) {
             if data.len() + self.data.len() > total_size {
@@ -173,9 +187,7 @@ impl RecvTransfer {
                 self.part += 1;
                 self.confirm_count = 0;
             }
-            self.complete()?.part = message.part;
-            serialize_inplace(&mut self.buf, &self.complete)?;
-            Ok(Some(&self.buf[..]))
+            self.build_part_completed_reply(message.part) 
         } else {
             if self.confirm_count == 9 {
                 let max_seqno = decoder.seqno;
@@ -184,12 +196,28 @@ impl RecvTransfer {
                 confirm.seqno = max_seqno as i32;
                 self.confirm_count = 0;
                 serialize_inplace(&mut self.buf, &self.confirm)?;
-                Ok(Some(&self.buf[..]))
+                let ret = TaggedByteSlice {
+                    object: &self.buf[..],
+                    #[cfg(feature = "telemetry")]
+                    tag: self.tag_confirm
+                };
+                Ok(Some(ret))
             } else {
                 self.confirm_count += 1;
                 Ok(None)
             }
         }
+    }
+
+    fn build_part_completed_reply(&mut self, part: i32) -> Result<Option<TaggedByteSlice>> {
+        self.complete()?.part = part;
+        serialize_inplace(&mut self.buf, &self.complete)?;
+        let ret = TaggedByteSlice {
+            object: &self.buf[..],
+            #[cfg(feature = "telemetry")]
+            tag: self.tag_complete
+        };
+        Ok(Some(ret))
     }
 
 }
@@ -462,7 +490,9 @@ struct RldpSendContext<'a> {
     adnl: Arc<AdnlNode>, 
     peers: AdnlPeers,
     send_transfer: SendTransfer<'a>,
-    transfer_id: TransferId
+    transfer_id: TransferId,
+    #[cfg(feature = "telemetry")]
+    tag: u32
 }
 
 #[cfg(feature = "telemetry")]
@@ -496,7 +526,11 @@ pub struct RldpNode {
     #[cfg(feature = "telemetry")]
     stats: Arc<RldpStats>,
     subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
-    transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>
+    transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
+    #[cfg(feature = "telemetry")]
+    tag_complete: u32,
+    #[cfg(feature = "telemetry")]
+    tag_confirm: u32
 }
 
 impl RldpNode {
@@ -519,7 +553,11 @@ impl RldpNode {
             #[cfg(feature = "telemetry")]
             stats: Arc::new(RldpStats::default()),
             subscribers: Arc::new(subscribers),
-            transfers: Arc::new(lockfree::map::Map::new())
+            transfers: Arc::new(lockfree::map::Map::new()),
+            #[cfg(feature = "telemetry")]
+            tag_complete: tag_from_unboxed_type::<RldpComplete>(),
+            #[cfg(feature = "telemetry")]
+            tag_confirm: tag_from_unboxed_type::<RldpConfirm>()
         };
         Ok(Arc::new(ret))
     }
@@ -527,30 +565,28 @@ impl RldpNode {
     /// Send query 
     pub async fn query(
         &self, 
-        data: &[u8],
+        data: &TaggedByteSlice<'_>,
         max_answer_size: Option<i64>,
         peers: &AdnlPeers,
         roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {
-        #[cfg(feature = "telemetry")]
-        let tag = Self::fetch_tag(data);
         let ret = self.query_transfer(data, max_answer_size, peers, roundtrip).await;
         #[cfg(feature = "telemetry")]
         match &ret {
             Err(e) => log::info!(
                 target: TARGET, 
                 "RLDP STAT recv: failed {:x} from {}: {}", 
-                tag, peers.other(), e
+                data.tag, peers.other(), e
             ),
-            Ok((Some(data), _)) => log::info!(
+            Ok((Some(reply), _)) => log::info!(
                 target: TARGET, 
                 "RLDP STAT recv: success {:x} from {}: {} bytes", 
-                tag, peers.other(), data.len()
+                data.tag, peers.other(), reply.len()
             ),
             Ok((None, _)) => log::info!(
                 target: TARGET, 
                 "RLDP STAT recv: no data {:x} from {}", 
-                tag, peers.other()
+                data.tag, peers.other()
             )
         }
         ret
@@ -654,7 +690,7 @@ impl RldpNode {
             query
         };
         #[cfg(feature = "telemetry")]
-        let tag = Self::fetch_tag(&query.data[..]);
+        let query_tag = Self::fetch_tag(&query.data[..]);
         let answer = if let (true, answer) = Query::process_rldp(
             &subscribers, 
             &query, 
@@ -668,7 +704,7 @@ impl RldpNode {
             };
             #[cfg(feature = "compression")] 
             let answer = if let Some(mut answer) = answer {
-                answer.data = ton::bytes(DataCompression::compress(&answer.data)?);
+                answer.object.data = ton::bytes(DataCompression::compress(&answer.object.data)?);
                 answer
             } else {
                 return Ok(None)
@@ -677,11 +713,13 @@ impl RldpNode {
         } else {
             fail!("No subscribers for query {:?}", query)
         };
-        let (len, max) = (answer.data.len(), query.max_answer_size as usize);
+        let (len, max) = (answer.object.data.len(), query.max_answer_size as usize);
         if len > max {
             fail!("Exceeded max RLDP answer size: {} vs {}", len, max)
         }
-        let data = serialize(&answer.into_boxed())?;
+        #[cfg(feature = "telemetry")]
+        let tag = answer.tag;
+        let data = serialize(&answer.object.into_boxed())?;
         let mut send_transfer_id = context.transfer_id.clone();
         for i in 0..send_transfer_id.len() {
             send_transfer_id[i] ^= 0xFF
@@ -714,7 +752,9 @@ impl RldpNode {
             adnl: context.adnl.clone(),
             peers: context.peers.clone(),
             send_transfer,
-            transfer_id: context.transfer_id.clone()
+            transfer_id: context.transfer_id.clone(),
+            #[cfg(feature = "telemetry")]
+            tag
         };
         if let (true, _) = Self::send_loop(context_send, None).await? {
             log::trace!(
@@ -727,7 +767,7 @@ impl RldpNode {
             log::info!(
                 target: TARGET, 
                 "RLDP STAT send: answer on {:x} sent in transfer {} to {}",
-                tag,
+                query_tag,
                 base64::encode(&context.transfer_id),
                 context.peers.other()  
             );
@@ -742,7 +782,7 @@ impl RldpNode {
             log::info!(
                 target: TARGET, 
                 "RLDP STAT send: answer on {:x} timed out in transfer {} to {}",
-                tag,
+                query_tag,
                 base64::encode(&context.transfer_id),
                 context.peers.other()  
             );
@@ -778,15 +818,15 @@ impl RldpNode {
 
     async fn query_transfer(
         &self, 
-        data: &[u8],
+        query_data: &TaggedByteSlice<'_>,
         max_answer_size: Option<i64>,
         peers: &AdnlPeers,
         roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {  
         #[cfg(not(feature = "compression"))]
-        let data = data.to_vec();
+        let data = query_data.object.to_vec();
         #[cfg(feature = "compression")]
-        let data = DataCompression::compress(data)?;
+        let data = DataCompression::compress(&query_data.object)?;
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
             query_id: ton::int256(query_id.clone()),
@@ -854,7 +894,9 @@ impl RldpNode {
             adnl: self.adnl.clone(),
             peers: peers.clone(),
             send_transfer,
-            transfer_id: send_transfer_id.clone()
+            transfer_id: send_transfer_id.clone(),
+            #[cfg(feature = "telemetry")]
+            tag: query_data.tag
         }; 
         let recv_context = RldpRecvContext {
             adnl: self.adnl.clone(),
@@ -1026,7 +1068,7 @@ impl RldpNode {
             match context.recv_transfer.process_chunk(job) {
                 Err(e) => log::warn!(target: TARGET, "RLDP error: {}", e),
                 Ok(Some(reply)) => {
-                    if let Err(e) = context.adnl.send_custom(reply, context.peers.clone()) {
+                    if let Err(e) = context.adnl.send_custom(&reply, context.peers.clone()) {
                         log::warn!(target: TARGET, "RLDP reply error: {}", e)
                     }
                 },
@@ -1084,10 +1126,12 @@ impl RldpNode {
             let mut recv_seqno = 0;
             'part: loop {                            
                 for _ in 0..transfer_wave {
-                    context.adnl.send_custom(
-                        context.send_transfer.prepare_chunk()?, 
-                        context.peers.clone()
-                    )?;
+                    let chunk = TaggedByteSlice {
+                        object: context.send_transfer.prepare_chunk()?, 
+                        #[cfg(feature = "telemetry")]
+                        tag: context.tag
+                    };
+                    context.adnl.send_custom(&chunk, context.peers.clone())?;
                     if context.send_transfer.is_finished_or_next_part(part)? {
                         break 'part;
                     }
@@ -1175,14 +1219,26 @@ impl Subscriber for RldpNode {
                                 part: msg.part,
                                 seqno: msg.seqno
                             }.into_boxed();
-                            let reply = serialize(&reply)?;
-                            self.adnl.send_custom(&reply[..], peers.clone())?;
+                            self.adnl.send_custom(
+                                &TaggedByteSlice {
+                                    object: &serialize(&reply)?[..], 
+                                    #[cfg(feature = "telemetry")]
+                                    tag: self.tag_confirm
+                                },
+                                peers.clone(),
+                            )?;
                             let reply = RldpComplete {
                                 transfer_id: msg.transfer_id,
                                 part: msg.part
                             }.into_boxed();
-                            let reply = serialize(&reply)?;
-                            self.adnl.send_custom(&reply[..], peers.clone())?;
+                            self.adnl.send_custom(
+                                &TaggedByteSlice {
+                                    object: &serialize(&reply)?[..], 
+                                    #[cfg(feature = "telemetry")]
+                                    tag: self.tag_complete
+                                },
+                                peers.clone(),
+                            )?;
                             log::info!(
                                 target: TARGET, 
                                 "Receive update on closed RLDP transfer {}, part {}, seqno {}",
