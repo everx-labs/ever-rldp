@@ -13,7 +13,7 @@ pub enum SymbolOps {
         dest: usize,
         scalar: Octet,
     },
-    FMA {
+    Fma {
         dest: usize,
         src: usize,
         scalar: Octet,
@@ -32,7 +32,7 @@ pub fn perform_op(op: &SymbolOps, symbols: &mut Vec<Symbol>) {
         SymbolOps::MulAssign { dest, scalar } => {
             symbols[*dest].mulassign_scalar(scalar);
         }
-        SymbolOps::FMA { dest, src, scalar } => {
+        SymbolOps::Fma { dest, src, scalar } => {
             let (dest, temp) = get_both_indices(symbols, *dest, *src);
             dest.fused_addassign_mul_scalar(temp, scalar);
         }

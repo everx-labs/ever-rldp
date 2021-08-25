@@ -186,7 +186,7 @@ impl SourceBlockDecoder {
         }
 
         self.decoded = true;
-        return Some(result);
+        Some(result)
     }
 
     pub fn decode<T: IntoIterator<Item = EncodingPacket>>(

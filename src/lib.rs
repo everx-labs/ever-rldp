@@ -95,13 +95,13 @@ impl RecvTransfer {
 
     fn new(transfer_id: TransferId) -> Self {
         let complete = RldpComplete {
-            transfer_id: ton::int256(transfer_id.clone()),
+            transfer_id: ton::int256(transfer_id),
             part: 0
         }.into_boxed();
         #[cfg(feature = "telemetry")]
         let tag_complete = tag_from_object(&complete);
         let confirm = RldpConfirm {
-            transfer_id: ton::int256(transfer_id.clone()),
+            transfer_id: ton::int256(transfer_id),
             part: 0,
             seqno: 0
         }.into_boxed();
@@ -142,6 +142,7 @@ impl RecvTransfer {
         }
     }
 
+    #[allow(clippy::boxed_local)]
     fn process_chunk(&mut self, message: Box<RldpMessagePart>) -> Result<Option<TaggedByteSlice>> {
         let fec_type = if let FecType::Fec_RaptorQ(fec_type) = message.fec_type {
             fec_type
@@ -159,22 +160,23 @@ impl RecvTransfer {
             self.data.reserve_exact(total_size);
             total_size
         };
-        let decoder = if self.part == message.part as u32 {
-            if let Some(decoder) = &mut self.decoder {
-                if fec_type.as_ref() != &decoder.params {
-                    fail!(
-                        "Incorrect parameters in RLDP packet {:?} vs {:?}", 
-                        fec_type, decoder.params
-                    )
+        let decoder = match self.part {
+            part if part == message.part as u32 => {
+                if let Some(decoder) = &mut self.decoder {
+                    if fec_type.as_ref() != &decoder.params {
+                        fail!(
+                            "Incorrect parameters in RLDP packet {:?} vs {:?}", 
+                            fec_type, decoder.params
+                        )
+                    }
+                    decoder
+                } else {
+                    self.decoder.get_or_insert_with(|| RaptorqDecoder::with_params(*fec_type))
                 }
-                decoder
-            } else {
-                self.decoder.get_or_insert_with(|| RaptorqDecoder::with_params(*fec_type))
-            }
-        } else if self.part > message.part as u32 {
-            return self.build_part_completed_reply(message.part)
-        } else {
-            return Ok(None)
+            },
+            part if part > message.part as u32 => 
+                return self.build_part_completed_reply(message.part),
+            _ => return Ok(None)
         };
         if let Some(mut data) = decoder.decode(message.seqno as u32, &message.data) {
             if data.len() + self.data.len() > total_size {
@@ -188,24 +190,22 @@ impl RecvTransfer {
                 self.confirm_count = 0;
             }
             self.build_part_completed_reply(message.part) 
+        } else if self.confirm_count == 9 {
+            let max_seqno = decoder.seqno;
+            let confirm = self.confirm()?;
+            confirm.part = message.part;
+            confirm.seqno = max_seqno as i32;
+            self.confirm_count = 0;
+            serialize_inplace(&mut self.buf, &self.confirm)?;
+            let ret = TaggedByteSlice {
+                object: &self.buf[..],
+                #[cfg(feature = "telemetry")]
+                tag: self.tag_confirm
+            };
+            Ok(Some(ret))
         } else {
-            if self.confirm_count == 9 {
-                let max_seqno = decoder.seqno;
-                let confirm = self.confirm()?;
-                confirm.part = message.part;
-                confirm.seqno = max_seqno as i32;
-                self.confirm_count = 0;
-                serialize_inplace(&mut self.buf, &self.confirm)?;
-                let ret = TaggedByteSlice {
-                    object: &self.buf[..],
-                    #[cfg(feature = "telemetry")]
-                    tag: self.tag_confirm
-                };
-                Ok(Some(ret))
-            } else {
-                self.confirm_count += 1;
-                Ok(None)
-            }
+            self.confirm_count += 1;
+            Ok(None)
         }
     }
 
@@ -600,7 +600,7 @@ impl RldpNode {
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
         let inserted = add_object_to_map(
             &self.transfers, 
-            transfer_id.clone(),
+            *transfer_id,
             || Ok(RldpTransfer::Recv(queue_sender.clone()))
         )?;
         if !inserted {
@@ -616,8 +616,8 @@ impl RldpNode {
             adnl: self.adnl.clone(),
             peers: peers.clone(),
             queue_reader,
-            recv_transfer: RecvTransfer::new(transfer_id.clone()),
-            transfer_id: transfer_id.clone()
+            recv_transfer: RecvTransfer::new(*transfer_id),
+            transfer_id: *transfer_id
         };
         #[cfg(feature = "telemetry")]
         let stats = self.stats.clone();
@@ -626,7 +626,7 @@ impl RldpNode {
         tokio::spawn(
             async move {
                 Self::receive_loop(&mut context, None).await;
-                transfers.insert(context.transfer_id.clone(), RldpTransfer::Done);
+                transfers.insert(context.transfer_id, RldpTransfer::Done);
                 let send_transfer_id = Self::answer_transfer_loop(
                     &mut context, 
                     subscribers, 
@@ -655,7 +655,7 @@ impl RldpNode {
             }
         );
         let transfers = self.transfers.clone();
-        let transfer_id = transfer_id.clone();
+        let transfer_id = *transfer_id;
         tokio::spawn(
             async move {
                 tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX)).await;
@@ -720,9 +720,9 @@ impl RldpNode {
         #[cfg(feature = "telemetry")]
         let tag = answer.tag;
         let data = serialize(&answer.object.into_boxed())?;
-        let mut send_transfer_id = context.transfer_id.clone();
-        for i in 0..send_transfer_id.len() {
-            send_transfer_id[i] ^= 0xFF
+        let mut send_transfer_id = context.transfer_id;
+        for x in &mut send_transfer_id {
+            *x ^= 0xFF
         } 
         let now = Version::get();
         if now >= query.timeout {
@@ -743,16 +743,16 @@ impl RldpNode {
                 context.peers.other()  
             )
         }
-        let send_transfer = SendTransfer::new(&data[..], Some(send_transfer_id.clone()));
+        let send_transfer = SendTransfer::new(&data[..], Some(send_transfer_id));
         transfers.insert(
-            send_transfer_id.clone(), 
+            send_transfer_id, 
             RldpTransfer::Send(send_transfer.state.clone())
         );
         let context_send = RldpSendContext {
             adnl: context.adnl.clone(),
             peers: context.peers.clone(),
             send_transfer,
-            transfer_id: context.transfer_id.clone(),
+            transfer_id: context.transfer_id,
             #[cfg(feature = "telemetry")]
             tag
         };
@@ -829,7 +829,7 @@ impl RldpNode {
         let data = DataCompression::compress(&query_data.object)?;
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
-            query_id: ton::int256(query_id.clone()),
+            query_id: ton::int256(query_id),
             max_answer_size: max_answer_size.unwrap_or(128 * 1024),
             timeout: Version::get() + Self::TIMEOUT_MAX as i32/1000,
             data: ton::bytes(data)
@@ -875,26 +875,26 @@ impl RldpNode {
         #[cfg(feature = "telemetry")]
         log::trace!(target: TARGET, "RLDP STAT send: transfers total {}, active {}", all, now);
         let send_transfer = SendTransfer::new(&data[..], None);
-        let send_transfer_id = send_transfer.message.transfer_id().0.clone();
+        let send_transfer_id = send_transfer.message.transfer_id().0;
         self.transfers.insert(
-            send_transfer_id.clone(), 
+            send_transfer_id, 
             RldpTransfer::Send(send_transfer.state.clone())
         );
-        let mut recv_transfer_id = send_transfer_id.clone();
-        for i in 0..recv_transfer_id.len() {
-            recv_transfer_id[i] ^= 0xFF
+        let mut recv_transfer_id = send_transfer_id;
+        for x in &mut recv_transfer_id {
+            *x ^= 0xFF
         } 
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
-        let recv_transfer = RecvTransfer::new(recv_transfer_id.clone());
+        let recv_transfer = RecvTransfer::new(recv_transfer_id);
         self.transfers.insert(
-            recv_transfer_id.clone(), 
+            recv_transfer_id, 
             RldpTransfer::Recv(queue_sender)
         );
         let send_context = RldpSendContext {
             adnl: self.adnl.clone(),
             peers: peers.clone(),
             send_transfer,
-            transfer_id: send_transfer_id.clone(),
+            transfer_id: send_transfer_id,
             #[cfg(feature = "telemetry")]
             tag: query_data.tag
         }; 
@@ -903,7 +903,7 @@ impl RldpNode {
             peers: peers.clone(),
             queue_reader,
             recv_transfer,
-            transfer_id: send_transfer_id.clone()
+            transfer_id: send_transfer_id
         }; 
         log::trace!(
             target: TARGET, 
@@ -988,7 +988,7 @@ impl RldpNode {
         let peers = send_context.peers.clone();
         let recv_state = recv_context.recv_transfer.state.clone();
         let send_state = send_context.send_transfer.state.clone();
-        let send_transfer_id = send_context.transfer_id.clone();
+        let send_transfer_id = send_context.transfer_id;
         tokio::spawn(
             async move {
                 Self::receive_loop(&mut recv_context, Some(send_state)).await;
@@ -997,7 +997,7 @@ impl RldpNode {
         );
         let (ok, mut roundtrip) = Self::send_loop(send_context, roundtrip).await?;
         let mut timeout = Self::calc_timeout(Some(roundtrip));
-        self.transfers.insert(send_transfer_id.clone(), RldpTransfer::Done);
+        self.transfers.insert(send_transfer_id, RldpTransfer::Done);
         if ok {
             log::trace!(
                 target: TARGET, 
@@ -1064,7 +1064,7 @@ impl RldpNode {
         mut send_state: Option<Arc<SendTransferState>>
     ) {
         while let Some(job) = context.queue_reader.recv().await {
-            let begin = context.recv_transfer.data.len() == 0;
+            let begin = context.recv_transfer.data.is_empty();
             match context.recv_transfer.process_chunk(job) {
                 Err(e) => log::warn!(target: TARGET, "RLDP error: {}", e),
                 Ok(Some(reply)) => {
@@ -1078,7 +1078,7 @@ impl RldpNode {
             if let Some(send_state) = send_state.take() {
                 send_state.set_reply();                    
             }
-            if begin && (context.recv_transfer.data.len() > 0) {
+            if begin && !context.recv_transfer.data.is_empty() {
                 log::trace!(
                     target: TARGET,
                     "transfer id {}, received first {}, total to receive {:?}",
@@ -1105,7 +1105,7 @@ impl RldpNode {
         }   
         // Graceful close
         context.queue_reader.close();
-        while let Some(_) = context.queue_reader.recv().await {
+        while context.queue_reader.recv().await.is_some() {
         }
     }
 
@@ -1246,12 +1246,10 @@ impl Subscriber for RldpNode {
                             );
                             break
                         }
+                    } else if let Some(queue_sender) = self.answer_transfer(transfer_id, peers)? {
+                        queue_sender.send(msg)
                     } else {
-                        if let Some(queue_sender) = self.answer_transfer(transfer_id, peers)? {
-                            queue_sender.send(msg)
-                        } else {
-                            continue
-                        }
+                        continue
                     };
                     match result {
                         Ok(()) => (),

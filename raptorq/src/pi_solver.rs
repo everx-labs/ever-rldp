@@ -180,7 +180,7 @@ impl FirstPhaseRowSelectionStats {
             graph.add_edge(ones[0] as u16, ones[1] as u16);
         }
         graph.build();
-        return graph;
+        graph
     }
 
     #[inline(never)]
@@ -265,7 +265,7 @@ impl FirstPhaseRowSelectionStats {
                 }
             }
         }
-        return chosen.unwrap();
+        chosen.unwrap()
     }
 
     // Verify there there are no non-HPDC rows with exactly two non-zero entries, greater than one
@@ -309,10 +309,10 @@ impl FirstPhaseRowSelectionStats {
             #[cfg(debug_assertions)]
             self.first_phase_graph_substep_verify(start_row, end_row);
             let row = self.first_phase_graph_substep(start_row, end_row, matrix);
-            return (Some(row), r);
+            (Some(row), r)
         } else {
             let row = self.first_phase_original_degree_substep(start_row, end_row, r.unwrap());
-            return (Some(row), r);
+            (Some(row), r)
         }
     }
 }
@@ -415,9 +415,9 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 SymbolOps::MulAssign { dest, scalar } => {
                     self.D[*dest].mulassign_scalar(scalar);
                 }
-                SymbolOps::FMA { dest, src, scalar } => {
+                SymbolOps::Fma { dest, src, scalar } => {
                     let (dest, temp) = get_both_indices(&mut self.D, *dest, *src);
-                    dest.fused_addassign_mul_scalar(&temp, scalar);
+                    dest.fused_addassign_mul_scalar(temp, scalar);
                 }
                 SymbolOps::Reorder { order: _order } => {}
             }
@@ -441,7 +441,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 }
             }
         }
-        return true;
+        true
     }
 
     #[cfg(debug_assertions)]
@@ -451,7 +451,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 return hdpc.get(row - (self.A.height() - hdpc.height()), col);
             }
         }
-        return self.A.get(row, col);
+        self.A.get(row, col)
     }
 
     // Performs the column swapping substep of first phase, after the row has been chosen
@@ -629,7 +629,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         }
 
         self.record_symbol_ops(0);
-        return true;
+        true
     }
 
     // See section 5.4.2.2. Verifies the two all-zeros submatrices and the identity submatrix
@@ -673,7 +673,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         self.A.resize(self.L, self.L);
 
         self.record_symbol_ops(1);
-        return true;
+        true
     }
 
     // Verifies that X is lower triangular. See section 5.4.2.3
@@ -721,7 +721,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 } else {
                     self.debug_symbol_mul_ops += 1;
                     self.debug_symbol_add_ops += 1;
-                    self.deferred_D_ops.push(SymbolOps::FMA {
+                    self.deferred_D_ops.push(SymbolOps::Fma {
                         dest: self.d[row],
                         src: self.d[col],
                         scalar: self.X.get(row, col),
@@ -928,7 +928,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
             }
         }
 
-        return Some(submatrix);
+        Some(submatrix)
     }
 
     // Performs backwards elimination in a size x size submatrix, starting at
@@ -1020,16 +1020,15 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
     }
 
     fn record_fma_rows(&mut self, i: usize, iprime: usize, beta: Octet) {
+        self.debug_symbol_add_ops += 1;
         if beta == Octet::one() {
-            self.debug_symbol_add_ops += 1;
             self.deferred_D_ops.push(SymbolOps::AddAssign {
                 dest: self.d[iprime],
                 src: self.d[i],
             });
         } else {
-            self.debug_symbol_add_ops += 1;
             self.debug_symbol_mul_ops += 1;
-            self.deferred_D_ops.push(SymbolOps::FMA {
+            self.deferred_D_ops.push(SymbolOps::Fma {
                 dest: self.d[iprime],
                 src: self.d[i],
                 scalar: beta,
@@ -1137,9 +1136,9 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
             reorder.push(*i);
         }
 
-        let mut operation_vector = std::mem::replace(&mut self.deferred_D_ops, vec![]);
+        let mut operation_vector = std::mem::take(&mut self.deferred_D_ops);
         operation_vector.push(SymbolOps::Reorder { order: reorder });
-        return (Some(result), Some(operation_vector));
+        (Some(result), Some(operation_vector))
     }
 }
 

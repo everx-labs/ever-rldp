@@ -74,11 +74,11 @@ pub const OCTET_MUL_HI_BITS: [[u8; 32]; 256] = calculate_octet_mul_hi_table();
 pub const OCTET_MUL_LOW_BITS: [[u8; 32]; 256] = calculate_octet_mul_low_table();
 
 const fn const_mul(x: usize, y: usize) -> u8 {
-    return OCT_EXP[OCT_LOG[x] as usize + OCT_LOG[y] as usize];
+    OCT_EXP[OCT_LOG[x] as usize + OCT_LOG[y] as usize]
 }
 
 const fn calculate_octet_mul_hi_table() -> [[u8; 32]; 256] {
-    return [
+    [
         [0; 32],
         calculate_octet_mul_hi_table_inner(1),
         calculate_octet_mul_hi_table_inner(2),
@@ -335,11 +335,11 @@ const fn calculate_octet_mul_hi_table() -> [[u8; 32]; 256] {
         calculate_octet_mul_hi_table_inner(253),
         calculate_octet_mul_hi_table_inner(254),
         calculate_octet_mul_hi_table_inner(255),
-    ];
+    ]
 }
 
 const fn calculate_octet_mul_hi_table_inner(x: usize) -> [u8; 32] {
-    return [
+    [
         0,
         const_mul(x, 1 << 4),
         const_mul(x, 2 << 4),
@@ -372,11 +372,11 @@ const fn calculate_octet_mul_hi_table_inner(x: usize) -> [u8; 32] {
         const_mul(x, 13 << 4),
         const_mul(x, 14 << 4),
         const_mul(x, 15 << 4),
-    ];
+    ]
 }
 
 const fn calculate_octet_mul_low_table() -> [[u8; 32]; 256] {
-    return [
+    [
         [0; 32],
         calculate_octet_mul_low_table_inner(1),
         calculate_octet_mul_low_table_inner(2),
@@ -633,11 +633,11 @@ const fn calculate_octet_mul_low_table() -> [[u8; 32]; 256] {
         calculate_octet_mul_low_table_inner(253),
         calculate_octet_mul_low_table_inner(254),
         calculate_octet_mul_low_table_inner(255),
-    ];
+    ]
 }
 
 const fn calculate_octet_mul_low_table_inner(x: usize) -> [u8; 32] {
-    return [
+    [
         0,
         const_mul(x, 1),
         const_mul(x, 2),
@@ -670,11 +670,11 @@ const fn calculate_octet_mul_low_table_inner(x: usize) -> [u8; 32] {
         const_mul(x, 13),
         const_mul(x, 14),
         const_mul(x, 15),
-    ];
+    ]
 }
 
 const fn calculate_octet_mul_table() -> [[u8; 256]; 256] {
-    return [
+    [
         [0; 256],
         calculate_octet_mul_table_inner(1),
         calculate_octet_mul_table_inner(2),
@@ -931,11 +931,11 @@ const fn calculate_octet_mul_table() -> [[u8; 256]; 256] {
         calculate_octet_mul_table_inner(253),
         calculate_octet_mul_table_inner(254),
         calculate_octet_mul_table_inner(255),
-    ];
+    ]
 }
 
 const fn calculate_octet_mul_table_inner(x: usize) -> [u8; 256] {
-    return [
+    [
         0,
         const_mul(x, 1),
         const_mul(x, 2),
@@ -1192,7 +1192,7 @@ const fn calculate_octet_mul_table_inner(x: usize) -> [u8; 256] {
         const_mul(x, 253),
         const_mul(x, 254),
         const_mul(x, 255),
-    ];
+    ]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -1260,14 +1260,14 @@ impl<'a, 'b> Add<&'b Octet> for &'a Octet {
 }
 
 impl AddAssign for Octet {
-    #[allow(clippy::suspicious_arithmetic_impl)]
+    #[allow(clippy::suspicious_op_assign_impl)]
     fn add_assign(&mut self, other: Octet) {
         self.value ^= other.value;
     }
 }
 
 impl<'a> AddAssign<&'a Octet> for Octet {
-    #[allow(clippy::suspicious_arithmetic_impl)]
+    #[allow(clippy::suspicious_op_assign_impl)]
     fn add_assign(&mut self, other: &'a Octet) {
         self.value ^= other.value;
     }
@@ -1275,7 +1275,6 @@ impl<'a> AddAssign<&'a Octet> for Octet {
 
 impl Sub for Octet {
     type Output = Octet;
-
     #[allow(clippy::suspicious_arithmetic_impl)]
     fn sub(self, rhs: Octet) -> Octet {
         Octet {

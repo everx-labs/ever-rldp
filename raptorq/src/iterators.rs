@@ -20,14 +20,14 @@ impl Iterator for ClonedOctetIter {
         if self.sparse {
             let elements = self.sparse_elements.as_ref().unwrap();
             if self.sparse_index == elements.len() {
-                return None;
+                None
             } else {
                 let old_index = self.sparse_index;
                 self.sparse_index += 1;
-                return Some(elements[old_index].clone());
+                Some(elements[old_index].clone())
             }
         } else if self.dense_index == self.end_col {
-            return None;
+            None
         } else {
             let old_index = self.dense_index;
             self.dense_index += 1;
@@ -40,7 +40,7 @@ impl Iterator for ClonedOctetIter {
             } else {
                 Octet::one()
             };
-            return Some((old_index, value));
+            Some((old_index, value))
         }
     }
 }
@@ -128,7 +128,7 @@ impl<'a> Iterator for OctetIter<'a> {
             let elements = self.sparse_elements.unwrap();
             // Need to iterate over the whole array, since they're not sorted by logical col
             if self.sparse_index >= elements.len() {
-                return None;
+                None
             } else {
                 while self.sparse_index < elements.len() {
                     let entry = elements.get_by_raw_index(self.sparse_index);
@@ -138,10 +138,10 @@ impl<'a> Iterator for OctetIter<'a> {
                         return Some((logical_col as usize, entry.1));
                     }
                 }
-                return None;
+                None
             }
         } else if self.dense_index == self.end_col {
-            return None;
+            None
         } else {
             let old_index = self.dense_index;
             self.dense_index += 1;
@@ -152,7 +152,7 @@ impl<'a> Iterator for OctetIter<'a> {
                 } else {
                     Octet::one()
                 };
-            return Some((old_index, value));
+            Some((old_index, value))
         }
     }
 }
