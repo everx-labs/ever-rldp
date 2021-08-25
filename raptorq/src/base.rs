@@ -72,7 +72,7 @@ impl EncodingPacket {
         let mut serialized = Vec::with_capacity(4 + self.data.len());
         serialized.extend_from_slice(&self.payload_id.serialize());
         serialized.extend(self.data.iter());
-        return serialized;
+        serialized
     }
 
     /// Retrieves packet payload ID.

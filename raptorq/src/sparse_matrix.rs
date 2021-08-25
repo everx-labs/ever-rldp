@@ -59,7 +59,7 @@ impl SparseBinaryMatrix {
 
     // Returns (word in elements vec, and bit in word) for the given col
     fn bit_position(&self, row: usize, col: usize) -> (usize, usize) {
-        return (self.height * (col / WORD_WIDTH) + row, col % WORD_WIDTH);
+        (self.height * (col / WORD_WIDTH) + row, col % WORD_WIDTH)
     }
 
     // Return the word in which bit lives
@@ -155,7 +155,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
                 ones += 1;
             }
         }
-        return ones;
+        ones
     }
 
     fn get_sub_row_as_octets(&self, row: usize, start_col: usize) -> Vec<u8> {
@@ -165,7 +165,6 @@ impl BinaryMatrix for SparseBinaryMatrix {
         for col in start_col..self.width {
             result.push(self.get(row, col).byte());
         }
-
         result
     }
 
@@ -175,14 +174,12 @@ impl BinaryMatrix for SparseBinaryMatrix {
         if self.width - j <= self.num_dense_columns {
             let (word, bit) = self.bit_position(physical_i, self.width - j - 1);
             if self.dense_elements[word] & SparseBinaryMatrix::select_mask(bit) == 0 {
-                return Octet::zero();
+                Octet::zero()
             } else {
-                return Octet::one();
+                Octet::one()
             }
         } else {
-            return self.sparse_elements[physical_i]
-                .get(physical_j)
-                .unwrap_or_else(Octet::zero);
+            self.sparse_elements[physical_i].get(physical_j).unwrap_or_else(Octet::zero)
         }
     }
 
@@ -201,7 +198,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
     }
 
     fn get_ones_in_column(&self, col: usize, start_row: usize, end_row: usize) -> Vec<u32> {
-        assert_eq!(self.column_index_disabled, false);
+        assert!(!self.column_index_disabled);
         #[cfg(debug_assertions)]
         debug_assert!(self.debug_indexed_column_valid[col]);
         let physical_col = self.logical_col_to_physical[col];
@@ -264,7 +261,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
             i,
             "Can only freeze the last sparse column"
         );
-        assert_eq!(self.column_index_disabled, false);
+        assert!(!self.column_index_disabled);
         self.num_dense_columns += 1;
         let (last_word, last_bit) = self.bit_position(self.height, self.num_dense_columns - 1);
         // If this is in a new word

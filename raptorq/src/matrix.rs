@@ -67,7 +67,7 @@ pub struct DenseBinaryMatrix {
 impl DenseBinaryMatrix {
     // Returns (word in elements vec, and bit in word) for the given col
     pub fn bit_position(col: usize) -> (usize, usize) {
-        return (col / WORD_WIDTH, col % WORD_WIDTH);
+        (col / WORD_WIDTH, col % WORD_WIDTH)
     }
 
     // Returns mask to select the given bit in a word
@@ -154,7 +154,7 @@ impl BinaryMatrix for DenseBinaryMatrix {
             ones += bits.count_ones();
         }
 
-        return ones as usize;
+        ones as usize
     }
 
     fn get_row_iter(&self, row: usize, start_col: usize, end_col: usize) -> OctetIter {
@@ -168,7 +168,6 @@ impl BinaryMatrix for DenseBinaryMatrix {
                 rows.push(row as u32);
             }
         }
-
         rows
     }
 
@@ -177,16 +176,15 @@ impl BinaryMatrix for DenseBinaryMatrix {
         for col in start_col..self.width {
             result.push(self.get(row, col).byte());
         }
-
         result
     }
 
     fn get(&self, i: usize, j: usize) -> Octet {
         let (word, bit) = DenseBinaryMatrix::bit_position(j);
         if self.elements[i][word] & DenseBinaryMatrix::select_mask(bit) == 0 {
-            return Octet::zero();
+            Octet::zero()
         } else {
-            return Octet::one();
+            Octet::one()
         }
     }
 

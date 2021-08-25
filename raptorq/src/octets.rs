@@ -27,7 +27,7 @@ unsafe fn mulassign_scalar_avx2(octets: &mut [u8], scalar: &Octet) {
     use std::arch::x86_64::*;
 
     let low_mask = _mm256_set1_epi8(0x0F);
-    let hi_mask = _mm256_set1_epi8(0xF0 as u8 as i8);
+    let hi_mask = _mm256_set1_epi8(0xF0_u8 as i8);
     let self_avx_ptr = octets.as_mut_ptr();
     // Safe because _mm256_loadu_si256 loads from unaligned memory
     #[allow(clippy::cast_ptr_alignment)]
@@ -69,7 +69,7 @@ unsafe fn mulassign_scalar_ssse3(octets: &mut [u8], scalar: &Octet) {
     use std::arch::x86_64::*;
 
     let low_mask = _mm_set1_epi8(0x0F);
-    let hi_mask = _mm_set1_epi8(0xF0 as u8 as i8);
+    let hi_mask = _mm_set1_epi8(0xF0_u8 as i8);
     let self_ssse_ptr = octets.as_mut_ptr();
     #[allow(clippy::cast_ptr_alignment)]
     let low_table =
@@ -114,8 +114,7 @@ pub fn mulassign_scalar(octets: &mut [u8], scalar: &Octet) {
             }
         }
     }
-
-    return mulassign_scalar_fallback(octets, scalar);
+    mulassign_scalar_fallback(octets, scalar)
 }
 
 fn fused_addassign_mul_scalar_fallback(octets: &mut [u8], other: &[u8], scalar: &Octet) {
@@ -138,7 +137,7 @@ unsafe fn fused_addassign_mul_scalar_avx2(octets: &mut [u8], other: &[u8], scala
     use std::arch::x86_64::*;
 
     let low_mask = _mm256_set1_epi8(0x0F);
-    let hi_mask = _mm256_set1_epi8(0xF0 as u8 as i8);
+    let hi_mask = _mm256_set1_epi8(0xF0_u8 as i8);
     let self_avx_ptr = octets.as_mut_ptr();
     let other_avx_ptr = other.as_ptr();
     // Safe because _mm256_loadu_si256 loads from unaligned memory
@@ -187,7 +186,7 @@ unsafe fn fused_addassign_mul_scalar_ssse3(octets: &mut [u8], other: &[u8], scal
     use std::arch::x86_64::*;
 
     let low_mask = _mm_set1_epi8(0x0F);
-    let hi_mask = _mm_set1_epi8(0xF0 as u8 as i8);
+    let hi_mask = _mm_set1_epi8(0xF0_u8 as i8);
     let self_ssse_ptr = octets.as_mut_ptr();
     let other_ssse_ptr = other.as_ptr();
     #[allow(clippy::cast_ptr_alignment)]
@@ -252,7 +251,7 @@ pub fn fused_addassign_mul_scalar(octets: &mut [u8], other: &[u8], scalar: &Octe
         }
     }
 
-    return fused_addassign_mul_scalar_fallback(octets, other, scalar);
+    fused_addassign_mul_scalar_fallback(octets, other, scalar)
 }
 
 fn add_assign_fallback(octets: &mut [u8], other: &[u8]) {
@@ -372,7 +371,6 @@ pub fn add_assign(octets: &mut [u8], other: &[u8]) {
             }
         }
     }
-
-    return add_assign_fallback(octets, other);
+    add_assign_fallback(octets, other)
 }
 
