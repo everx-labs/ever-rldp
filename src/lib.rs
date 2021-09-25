@@ -1,22 +1,21 @@
 use adnl::{ 
-    dump, 
+    declare_counted, dump, 
     common::{
-        add_object_to_map, deserialize, get256, AdnlPeers, KeyId, Query, QueryId, serialize, 
-        serialize_inplace, Subscriber, TaggedByteSlice, Version
+        add_counted_object_to_map, add_unbound_object_to_map, deserialize, get256, AdnlPeers, 
+        CountedObject, Counter, KeyId, Query, QueryId, serialize, serialize_inplace, Subscriber,
+        TaggedByteSlice, Version
     },
     node::AdnlNode
 };
 #[cfg(feature = "telemetry")]
-use adnl::common::{tag_from_object, tag_from_unboxed_type};
+use adnl::{common::{tag_from_object, tag_from_unboxed_type}, telemetry::Metric};
 #[cfg(feature = "compression")]
 use adnl::node::DataCompression;
 use rand::Rng;
 use std::{
-    cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}}, 
+    cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, 
     time::{Duration, Instant}
 };
-#[cfg(feature = "telemetry")]
-use std::sync::atomic::AtomicU64; 
 use ton_api::{
     IntoBoxed, 
     ton::{
@@ -93,7 +92,7 @@ struct RecvTransfer {
 
 impl RecvTransfer {
 
-    fn new(transfer_id: TransferId) -> Self {
+    fn new(transfer_id: TransferId, counter: Arc<AtomicU64>) -> Self {
         let complete = RldpComplete {
             transfer_id: ton::int256(transfer_id),
             part: 0
@@ -117,7 +116,8 @@ impl RecvTransfer {
             part: 0,
             state: Arc::new(
                 RecvTransferState {
-                    updates: AtomicU32::new(0)
+                    updates: AtomicU32::new(0),
+                    counter: counter.into()
                 }
             ),
             total_size: None,
@@ -222,9 +222,11 @@ impl RecvTransfer {
 
 }
 
-struct RecvTransferState {
-    updates: AtomicU32
-}
+declare_counted!(
+    struct RecvTransferState {
+        updates: AtomicU32
+    }
+);
 
 impl RecvTransferState {
     fn updates(&self) -> u32 {
@@ -311,7 +313,7 @@ impl <'a> SendTransfer<'a> {
     const SYMBOL: usize = 768;
     const WINDOW: usize = 1000;
 
-    fn new(data: &'a [u8], transfer_id: Option<TransferId>) -> Self {
+    fn new(data: &'a [u8], transfer_id: Option<TransferId>, counter: Arc<AtomicU64>) -> Self {
         let transfer_id = transfer_id.unwrap_or_else(
             || rand::thread_rng().gen()
         );
@@ -337,7 +339,8 @@ impl <'a> SendTransfer<'a> {
                     part: AtomicU32::new(0),
                     reply: AtomicBool::new(false),
                     seqno_sent: AtomicU32::new(0),
-                    seqno_recv: AtomicU32::new(0)
+                    seqno_recv: AtomicU32::new(0),
+                    counter: counter.into()
                 }
             )
         }
@@ -420,12 +423,14 @@ impl <'a> SendTransfer<'a> {
 
 }
 
-struct SendTransferState {
-    part: AtomicU32,
-    reply: AtomicBool,
-    seqno_sent: AtomicU32,
-    seqno_recv: AtomicU32
-}
+declare_counted!(
+    struct SendTransferState {
+        part: AtomicU32,
+        reply: AtomicBool,
+        seqno_sent: AtomicU32,
+        seqno_recv: AtomicU32
+    }
+);
 
 impl SendTransferState {
     fn has_reply(&self) -> bool {
@@ -514,9 +519,24 @@ impl RldpStats {
     }
 }
 
-struct RldpPeer {
-    queries: AtomicU32,
-    queue: lockfree::queue::Queue<Arc<tokio::sync::Barrier>>
+declare_counted!(
+    struct RldpPeer {
+        queries: AtomicU32,
+        queue: lockfree::queue::Queue<Arc<tokio::sync::Barrier>>
+    }
+);
+
+struct RldpAlloc {
+    peers: Arc<AtomicU64>,
+    send_transfers: Arc<AtomicU64>,
+    recv_transfers: Arc<AtomicU64>
+}
+
+#[cfg(feature = "telemetry")]
+struct RldpTelemetry {
+    peers: Arc<Metric>,
+    recv_transfers: Arc<Metric>,
+    send_transfers: Arc<Metric>
 }
 
 /// Rldp Node
@@ -530,7 +550,10 @@ pub struct RldpNode {
     #[cfg(feature = "telemetry")]
     tag_complete: u32,
     #[cfg(feature = "telemetry")]
-    tag_confirm: u32
+    tag_confirm: u32,
+    #[cfg(feature = "telemetry")]
+    telemetry: RldpTelemetry,  
+    allocated: RldpAlloc
 }
 
 impl RldpNode {
@@ -547,6 +570,17 @@ impl RldpNode {
         adnl: Arc<AdnlNode>, 
         subscribers: Vec<Arc<dyn Subscriber>>
     ) -> Result<Arc<Self>> {
+        #[cfg(feature = "telemetry")]
+        let telemetry = RldpTelemetry {
+            peers: adnl.add_metric("Alloc RLDP peers"),
+            recv_transfers: adnl.add_metric("Alloc RLDP recv"),
+            send_transfers: adnl.add_metric("Alloc RLDP send")
+        };
+        let allocated = RldpAlloc {
+            peers: Arc::new(AtomicU64::new(0)),
+            recv_transfers: Arc::new(AtomicU64::new(0)),
+            send_transfers: Arc::new(AtomicU64::new(0))
+        };
         let ret = Self {
             adnl,
             peers: lockfree::map::Map::new(), 
@@ -557,7 +591,10 @@ impl RldpNode {
             #[cfg(feature = "telemetry")]
             tag_complete: tag_from_unboxed_type::<RldpComplete>(),
             #[cfg(feature = "telemetry")]
-            tag_confirm: tag_from_unboxed_type::<RldpConfirm>()
+            tag_confirm: tag_from_unboxed_type::<RldpConfirm>(),
+            #[cfg(feature = "telemetry")]
+            telemetry,
+            allocated
         };
         Ok(Arc::new(ret))
     }
@@ -598,7 +635,7 @@ impl RldpNode {
         peers: &AdnlPeers
     ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<Box<RldpMessagePart>>>> {
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
-        let inserted = add_object_to_map(
+        let inserted = add_unbound_object_to_map(
             &self.transfers, 
             *transfer_id,
             || Ok(RldpTransfer::Recv(queue_sender.clone()))
@@ -616,11 +653,18 @@ impl RldpNode {
             adnl: self.adnl.clone(),
             peers: peers.clone(),
             queue_reader,
-            recv_transfer: RecvTransfer::new(*transfer_id),
+            recv_transfer: RecvTransfer::new(*transfer_id, self.allocated.recv_transfers.clone()),
             transfer_id: *transfer_id
         };
         #[cfg(feature = "telemetry")]
+        self.telemetry.recv_transfers.update(
+            self.allocated.recv_transfers.load(Ordering::Relaxed)
+        );
+        #[cfg(feature = "telemetry")]
         let stats = self.stats.clone();
+        #[cfg(feature = "telemetry")]
+        let send_metric = self.telemetry.send_transfers.clone();
+        let send_counter = self.allocated.send_transfers.clone();
         let subscribers = self.subscribers.clone();
         let transfers = self.transfers.clone();
         tokio::spawn(
@@ -630,7 +674,10 @@ impl RldpNode {
                 let send_transfer_id = Self::answer_transfer_loop(
                     &mut context, 
                     subscribers, 
-                    transfers.clone()
+                    transfers.clone(),
+                    #[cfg(feature = "telemetry")]
+                    send_metric,
+                    send_counter
                 ).await.unwrap_or_else(
                     |e| {
                         log::warn!(
@@ -669,6 +716,9 @@ impl RldpNode {
         context: &mut RldpRecvContext, 
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
+        #[cfg(feature = "telemetry")]
+        send_metric: Arc<Metric>,
+        send_counter: Arc<AtomicU64>
     ) -> Result<Option<TransferId>> { 
 
         fn deserialize_query(context: &RldpRecvContext) -> Result<Box<RldpQuery>> {
@@ -743,7 +793,13 @@ impl RldpNode {
                 context.peers.other()  
             )
         }
-        let send_transfer = SendTransfer::new(&data[..], Some(send_transfer_id));
+        let send_transfer = SendTransfer::new(
+            &data[..], 
+            Some(send_transfer_id), 
+            send_counter.clone()
+        );
+        #[cfg(feature = "telemetry")]
+        send_metric.update(send_counter.load(Ordering::Relaxed));
         transfers.insert(
             send_transfer_id, 
             RldpTransfer::Send(send_transfer.state.clone())
@@ -838,14 +894,17 @@ impl RldpNode {
         let peer = if let Some(peer) = self.peers.get(peers.other()) {
             peer
         } else {
-            add_object_to_map(
+            add_counted_object_to_map(
                 &self.peers, 
                 peers.other().clone(),
                 || {
                     let ret = RldpPeer {
                         queries: AtomicU32::new(0),
-                        queue: lockfree::queue::Queue::new()
+                        queue: lockfree::queue::Queue::new(),
+                        counter: self.allocated.peers.clone().into()
                     };
+                    #[cfg(feature = "telemetry")]
+                    self.telemetry.peers.update(self.allocated.peers.load(Ordering::Relaxed));
                     Ok(ret)
                 }
             )?;
@@ -874,7 +933,15 @@ impl RldpNode {
         let now = RldpStats::inc(&self.stats.transfers_sent_now);
         #[cfg(feature = "telemetry")]
         log::trace!(target: TARGET, "RLDP STAT send: transfers total {}, active {}", all, now);
-        let send_transfer = SendTransfer::new(&data[..], None);
+        let send_transfer = SendTransfer::new(
+            &data[..], 
+            None, 
+            self.allocated.send_transfers.clone()
+        );
+        #[cfg(feature = "telemetry")]
+        self.telemetry.send_transfers.update(
+            self.allocated.send_transfers.load(Ordering::Relaxed)
+        );
         let send_transfer_id = send_transfer.message.transfer_id().0;
         self.transfers.insert(
             send_transfer_id, 
@@ -885,7 +952,14 @@ impl RldpNode {
             *x ^= 0xFF
         } 
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
-        let recv_transfer = RecvTransfer::new(recv_transfer_id);
+        let recv_transfer = RecvTransfer::new(
+            recv_transfer_id,
+            self.allocated.recv_transfers.clone()
+        );
+        #[cfg(feature = "telemetry")]
+        self.telemetry.recv_transfers.update(
+            self.allocated.recv_transfers.load(Ordering::Relaxed)
+        );
         self.transfers.insert(
             recv_transfer_id, 
             RldpTransfer::Recv(queue_sender)
@@ -897,14 +971,14 @@ impl RldpNode {
             transfer_id: send_transfer_id,
             #[cfg(feature = "telemetry")]
             tag: query_data.tag
-        }; 
+        };
         let recv_context = RldpRecvContext {
             adnl: self.adnl.clone(),
             peers: peers.clone(),
             queue_reader,
             recv_transfer,
             transfer_id: send_transfer_id
-        }; 
+        };
         log::trace!(
             target: TARGET, 
             "transfer id {}/{}, total to send {}", 
@@ -1173,10 +1247,18 @@ impl RldpNode {
 #[async_trait::async_trait]
 impl Subscriber for RldpNode {
 
+    #[cfg(feature = "telemetry")]
     async fn poll(&self, start: &Arc<Instant>) {
         if ((start.elapsed().as_secs() + 1) % Self::TIMEOUT_TELEMETRY) == 0 {
             self.print_stats()
         }
+        self.telemetry.peers.update(self.allocated.peers.load(Ordering::Relaxed));        
+        self.telemetry.recv_transfers.update(
+            self.allocated.recv_transfers.load(Ordering::Relaxed)
+        );
+        self.telemetry.send_transfers.update(
+            self.allocated.send_transfers.load(Ordering::Relaxed)
+        );
     }
 
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
@@ -1200,7 +1282,7 @@ impl Subscriber for RldpNode {
             },
             RldpMessagePartBoxed::Rldp_Confirm(msg) => {
                 if let Some(transfer) = self.transfers.get(&msg.transfer_id.0) {
-                    if let RldpTransfer::Send(transfer) = transfer.val() {                        
+                    if let RldpTransfer::Send(transfer) = transfer.val() {
                         if transfer.part() == msg.part as u32 {
                             transfer.set_seqno_recv(msg.seqno as u32);
                         }
