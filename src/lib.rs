@@ -2,13 +2,13 @@ use adnl::{
     declare_counted, dump, 
     common::{
         add_counted_object_to_map, add_unbound_object_to_map, deserialize, get256, AdnlPeers, 
-        CountedObject, Counter, KeyId, Query, QueryId, serialize, serialize_inplace, Subscriber,
+        CountedObject, Counter, KeyId, Query, QueryId, serialize, serialize_boxed_inplace, Subscriber,
         TaggedByteSlice, Version
     },
     node::AdnlNode
 };
 #[cfg(feature = "telemetry")]
-use adnl::{common::{tag_from_object, tag_from_unboxed_type}, telemetry::Metric};
+use adnl::{common::{tag_from_unboxed_object, tag_from_unboxed_type}, telemetry::Metric};
 #[cfg(feature = "compression")]
 use adnl::node::DataCompression;
 use rand::Rng;
@@ -76,8 +76,8 @@ impl RaptorqDecoder {
 
 struct RecvTransfer {
     buf: Vec<u8>,
-    complete: RldpMessagePartBoxed,
-    confirm: RldpMessagePartBoxed,
+    complete: RldpComplete,
+    confirm: RldpConfirm,
     confirm_count: usize,
     data: Vec<u8>,
     decoder: Option<RaptorqDecoder>,
@@ -96,16 +96,16 @@ impl RecvTransfer {
         let complete = RldpComplete {
             transfer_id: ton::int256(transfer_id),
             part: 0
-        }.into_boxed();
+        };
         #[cfg(feature = "telemetry")]
-        let tag_complete = tag_from_object(&complete);
+        let tag_complete = tag_from_unboxed_object(&complete);
         let confirm = RldpConfirm {
             transfer_id: ton::int256(transfer_id),
             part: 0,
             seqno: 0
-        }.into_boxed();
+        };
         #[cfg(feature = "telemetry")]
-        let tag_confirm = tag_from_object(&confirm);
+        let tag_confirm = tag_from_unboxed_object(&confirm);
         Self { 
             buf: Vec::new(),
             complete,
@@ -128,22 +128,16 @@ impl RecvTransfer {
         }
     }
 
-    fn complete(&mut self) -> Result<&mut RldpComplete> {
-        match self.complete { 
-            RldpMessagePartBoxed::Rldp_Complete(ref mut msg) => Ok(msg),
-            _ => fail!("INTERNAL ERROR: RLDP complete message mismatch")
-        }
+    fn complete_mut(&mut self) -> Result<&mut RldpComplete> {
+        Ok(&mut self.complete)
     }
 
-    fn confirm(&mut self) -> Result<&mut RldpConfirm> {
-        match self.confirm { 
-            RldpMessagePartBoxed::Rldp_Confirm(ref mut msg) => Ok(msg),
-            _ => fail!("INTERNAL ERROR: RLDP confirm message mismatch")
-        }
+    fn confirm_mut(&mut self) -> Result<&mut RldpConfirm> {
+        Ok(&mut self.confirm)
     }
 
     #[allow(clippy::boxed_local)]
-    fn process_chunk(&mut self, message: Box<RldpMessagePart>) -> Result<Option<TaggedByteSlice>> {
+    fn process_chunk(&mut self, message: RldpMessagePart) -> Result<Option<TaggedByteSlice>> {
         let fec_type = if let FecType::Fec_RaptorQ(fec_type) = message.fec_type {
             fec_type
         } else {
@@ -163,7 +157,7 @@ impl RecvTransfer {
         let decoder = match self.part {
             part if part == message.part as u32 => {
                 if let Some(decoder) = &mut self.decoder {
-                    if fec_type.as_ref() != &decoder.params {
+                    if fec_type != decoder.params {
                         fail!(
                             "Incorrect parameters in RLDP packet {:?} vs {:?}", 
                             fec_type, decoder.params
@@ -171,7 +165,7 @@ impl RecvTransfer {
                     }
                     decoder
                 } else {
-                    self.decoder.get_or_insert_with(|| RaptorqDecoder::with_params(*fec_type))
+                    self.decoder.get_or_insert_with(|| RaptorqDecoder::with_params(fec_type))
                 }
             },
             part if part > message.part as u32 => 
@@ -192,11 +186,11 @@ impl RecvTransfer {
             self.build_part_completed_reply(message.part) 
         } else if self.confirm_count == 9 {
             let max_seqno = decoder.seqno;
-            let confirm = self.confirm()?;
+            let confirm = self.confirm_mut()?;
             confirm.part = message.part;
             confirm.seqno = max_seqno as i32;
             self.confirm_count = 0;
-            serialize_inplace(&mut self.buf, &self.confirm)?;
+            serialize_boxed_inplace(&mut self.buf, &self.confirm)?;
             let ret = TaggedByteSlice {
                 object: &self.buf[..],
                 #[cfg(feature = "telemetry")]
@@ -210,8 +204,8 @@ impl RecvTransfer {
     }
 
     fn build_part_completed_reply(&mut self, part: i32) -> Result<Option<TaggedByteSlice>> {
-        self.complete()?.part = part;
-        serialize_inplace(&mut self.buf, &self.complete)?;
+        self.complete_mut()?.part = part;
+        serialize_boxed_inplace(&mut self.buf, &self.complete)?;
         let ret = TaggedByteSlice {
             object: &self.buf[..],
             #[cfg(feature = "telemetry")]
@@ -303,7 +297,7 @@ struct SendTransfer<'a> {
     buf: Vec<u8>,
     data: &'a [u8],
     encoder: Option<RaptorqEncoder>,
-    message: RldpMessagePartBoxed,
+    message: RldpMessagePart,
     state: Arc<SendTransferState>
 }
 
@@ -317,32 +311,32 @@ impl <'a> SendTransfer<'a> {
         let transfer_id = transfer_id.unwrap_or_else(
             || rand::thread_rng().gen()
         );
+        let fec_type = FecTypeRaptorQ {
+            data_size: 0,
+            symbol_size: Self::SYMBOL as i32, 
+            symbols_count: 0
+        }.into_boxed();
         let message = RldpMessagePart {
             transfer_id: ton::int256(transfer_id),
-            fec_type: FecTypeRaptorQ {
-                data_size: 0,
-                symbol_size: Self::SYMBOL as i32, 
-                symbols_count: 0
-            }.into_boxed(),
+            fec_type,
             part: 0,
             total_size: 0,
             seqno: 0,
             data: ton::bytes(Vec::new())
-        }.into_boxed();
+        };
+        let state = Arc::new(SendTransferState {
+            part: AtomicU32::new(0),
+            reply: AtomicBool::new(false),
+            seqno_sent: AtomicU32::new(0),
+            seqno_recv: AtomicU32::new(0),
+            counter: counter.into(),
+        });
         Self {
             buf: Vec::new(), 
             data,
             encoder: None,
             message,
-            state: Arc::new(
-                SendTransferState {
-                    part: AtomicU32::new(0),
-                    reply: AtomicBool::new(false),
-                    seqno_sent: AtomicU32::new(0),
-                    seqno_recv: AtomicU32::new(0),
-                    counter: counter.into()
-                }
-            )
+            state
         }
     }
 
@@ -363,11 +357,8 @@ impl <'a> SendTransfer<'a> {
         }
     }
 
-    fn message(&mut self) -> Result<&mut RldpMessagePart> {
-        match self.message { 
-            RldpMessagePartBoxed::Rldp_MessagePart(ref mut msg) => Ok(msg),
-            _ => fail!("INTERNAL ERROR: RLDP message mismatch")
-        }
+    fn message_mut(&mut self) -> Result<&mut RldpMessagePart> {
+        Ok(&mut self.message)
     }
 
     fn prepare_chunk(&mut self) -> Result<&[u8]> {     
@@ -375,7 +366,7 @@ impl <'a> SendTransfer<'a> {
             let mut seqno_sent = self.state.seqno_sent();
             let seqno_sent_original = seqno_sent;
             let chunk = encoder.encode(&mut seqno_sent)?;
-            let message = self.message()?;
+            let message = self.message_mut()?;
             message.seqno = seqno_sent as i32;
             message.data = ton::bytes(chunk);
             let seqno_recv = self.state.seqno_recv();
@@ -385,7 +376,7 @@ impl <'a> SendTransfer<'a> {
                 }
                 self.state.set_seqno_sent(seqno_sent);
             }
-            serialize_inplace(&mut self.buf, &self.message)?;
+            serialize_boxed_inplace(&mut self.buf, &self.message)?;
             Ok(&self.buf[..])        
         } else {
             fail!("Encoder is not ready");
@@ -406,7 +397,7 @@ impl <'a> SendTransfer<'a> {
         let encoder = RaptorqEncoder::with_data(
             &self.data[processed..processed + chunk_size]
         );
-        let message = self.message()?;
+        let message = self.message_mut()?;
         message.part = part as i32;
         message.total_size = total as i64;
         let ret = encoder.params.symbols_count;
@@ -478,7 +469,7 @@ impl SendTransferState {
 }
 
 enum RldpTransfer {
-    Recv(tokio::sync::mpsc::UnboundedSender<Box<RldpMessagePart>>),
+    Recv(tokio::sync::mpsc::UnboundedSender<RldpMessagePart>),
     Send(Arc<SendTransferState>),
     Done
 }
@@ -486,7 +477,7 @@ enum RldpTransfer {
 struct RldpRecvContext {
     adnl: Arc<AdnlNode>, 
     peers: AdnlPeers,
-    queue_reader: tokio::sync::mpsc::UnboundedReceiver<Box<RldpMessagePart>>,
+    queue_reader: tokio::sync::mpsc::UnboundedReceiver<RldpMessagePart>,
     recv_transfer: RecvTransfer,
     transfer_id: TransferId
 }
@@ -633,7 +624,7 @@ impl RldpNode {
         &self, 
         transfer_id: &TransferId, 
         peers: &AdnlPeers
-    ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<Box<RldpMessagePart>>>> {
+    ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<RldpMessagePart>>> {
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
         let inserted = add_unbound_object_to_map(
             &self.transfers, 
@@ -721,7 +712,7 @@ impl RldpNode {
         send_counter: Arc<AtomicU64>
     ) -> Result<Option<TransferId>> { 
 
-        fn deserialize_query(context: &RldpRecvContext) -> Result<Box<RldpQuery>> {
+        fn deserialize_query(context: &RldpRecvContext) -> Result<RldpQuery> {
             match deserialize(
                &context.recv_transfer.data[..]
             )?.downcast::<RldpMessageBoxed>() {
@@ -938,11 +929,7 @@ impl RldpNode {
             None, 
             self.allocated.send_transfers.clone()
         );
-        #[cfg(feature = "telemetry")]
-        self.telemetry.send_transfers.update(
-            self.allocated.send_transfers.load(Ordering::Relaxed)
-        );
-        let send_transfer_id = send_transfer.message.transfer_id().0;
+        let send_transfer_id = send_transfer.message.transfer_id.0;
         self.transfers.insert(
             send_transfer_id, 
             RldpTransfer::Send(send_transfer.state.clone())
