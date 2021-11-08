@@ -2,8 +2,8 @@ use adnl::{
     declare_counted, dump, 
     common::{
         add_counted_object_to_map, add_unbound_object_to_map, deserialize, get256, AdnlPeers, 
-        CountedObject, Counter, KeyId, Query, QueryId, serialize, serialize_boxed_inplace, Subscriber,
-        TaggedByteSlice, Version
+        CountedObject, Counter, KeyId, Query, QueryId, serialize, serialize_unboxed_inplace, 
+        Subscriber, TaggedByteSlice, Version
     },
     node::AdnlNode
 };
@@ -190,7 +190,7 @@ impl RecvTransfer {
             confirm.part = message.part;
             confirm.seqno = max_seqno as i32;
             self.confirm_count = 0;
-            serialize_boxed_inplace(&mut self.buf, &self.confirm)?;
+            serialize_unboxed_inplace(&mut self.buf, &self.confirm)?;
             let ret = TaggedByteSlice {
                 object: &self.buf[..],
                 #[cfg(feature = "telemetry")]
@@ -205,7 +205,7 @@ impl RecvTransfer {
 
     fn build_part_completed_reply(&mut self, part: i32) -> Result<Option<TaggedByteSlice>> {
         self.complete_mut()?.part = part;
-        serialize_boxed_inplace(&mut self.buf, &self.complete)?;
+        serialize_unboxed_inplace(&mut self.buf, &self.complete)?;
         let ret = TaggedByteSlice {
             object: &self.buf[..],
             #[cfg(feature = "telemetry")]
@@ -376,7 +376,7 @@ impl <'a> SendTransfer<'a> {
                 }
                 self.state.set_seqno_sent(seqno_sent);
             }
-            serialize_boxed_inplace(&mut self.buf, &self.message)?;
+            serialize_unboxed_inplace(&mut self.buf, &self.message)?;
             Ok(&self.buf[..])        
         } else {
             fail!("Encoder is not ready");
