@@ -14,8 +14,8 @@
 use adnl::{ 
     declare_counted, dump, 
     common::{
-        add_counted_object_to_map, add_unbound_object_to_map, deserialize, get256, AdnlPeers, 
-        CountedObject, Counter, KeyId, Query, QueryId, serialize, serialize_unboxed_inplace, 
+        add_counted_object_to_map, add_unbound_object_to_map, AdnlPeers, CountedObject, 
+        Counter, deserialize, KeyId, Query, QueryId, serialize, serialize_unboxed_inplace, 
         Subscriber, TaggedByteSlice, Version
     },
     node::AdnlNode
@@ -40,7 +40,7 @@ use ton_api::{
         }
     }
 };
-use ton_types::{fail, Result};
+use ton_types::{fail, Result, UInt256};
 pub use raptorq;
 
 const TARGET: &str = "rldp";
@@ -107,13 +107,13 @@ impl RecvTransfer {
 
     fn new(transfer_id: TransferId, counter: Arc<AtomicU64>) -> Self {
         let complete = RldpComplete {
-            transfer_id: ton::int256(transfer_id),
+            transfer_id: UInt256::with_array(transfer_id),
             part: 0
         };
         #[cfg(feature = "telemetry")]
         let tag_complete = tag_from_unboxed_object(&complete);
         let confirm = RldpConfirm {
-            transfer_id: ton::int256(transfer_id),
+            transfer_id: UInt256::with_array(transfer_id),
             part: 0,
             seqno: 0
         };
@@ -330,7 +330,7 @@ impl <'a> SendTransfer<'a> {
             symbols_count: 0
         }.into_boxed();
         let message = RldpMessagePart {
-            transfer_id: ton::int256(transfer_id),
+            transfer_id: UInt256::with_array(transfer_id),
             fec_type,
             part: 0,
             total_size: 0,
@@ -567,6 +567,7 @@ impl RldpNode {
     const SPINNER: u64 = 10;           // Milliseconds
     const TIMEOUT_MAX: u64 = 10000;    // Milliseconds
     const TIMEOUT_MIN: u64 = 500;      // Milliseconds
+    #[cfg(feature = "telemetry")]
     const TIMEOUT_TELEMETRY: u64 = 10; // Seconds
     
     /// Constructor 
@@ -873,6 +874,7 @@ impl RldpNode {
         start.elapsed().as_millis() as u64 > timeout + timeout * updates as u64 / 100
     }
 
+    #[cfg(feature = "telemetry")]
     fn print_stats(&self) {
     }
 
@@ -889,7 +891,7 @@ impl RldpNode {
         let data = DataCompression::compress(&query_data.object)?;
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
-            query_id: ton::int256(query_id),
+            query_id: UInt256::with_array(query_id),
             max_answer_size: max_answer_size.unwrap_or(128 * 1024),
             timeout: Version::get() + Self::TIMEOUT_MAX as i32/1000,
             data: ton::bytes(data)
@@ -942,7 +944,7 @@ impl RldpNode {
             None, 
             self.allocated.send_transfers.clone()
         );
-        let send_transfer_id = send_transfer.message.transfer_id.0;
+        let send_transfer_id = send_transfer.message.transfer_id.inner();
         self.transfers.insert(
             send_transfer_id, 
             RldpTransfer::Send(send_transfer.state.clone())
@@ -1026,20 +1028,21 @@ impl RldpNode {
         let (answer, roundtrip) = res?;
         if let Some(answer) = answer {
             match deserialize(&answer[..])?.downcast::<RldpMessageBoxed>() {
-                Ok(RldpMessageBoxed::Rldp_Answer(answer)) => if answer.query_id.0 != query_id {
-                    fail!("Unknown query ID in RLDP answer")
-                } else {
-                    #[cfg(not(feature = "compression"))]
-                    let data = answer.data.to_vec();
-                    #[cfg(feature = "compression")]
-                    let data = DataCompression::decompress(&answer.data)?;
-                    log::trace!(
-                        target: TARGET, 
-                        "RLDP answer {:02x}{:02x}{:02x}{:02x}...", 
-                        data[0], data[1], data[2], data[3]
-                    );
-                    Ok((Some(data), roundtrip))
-                },
+                Ok(RldpMessageBoxed::Rldp_Answer(answer)) => 
+                    if answer.query_id.as_slice() != &query_id {
+                        fail!("Unknown query ID in RLDP answer")
+                    } else {
+                        #[cfg(not(feature = "compression"))]
+                        let data = answer.data.to_vec();
+                        #[cfg(feature = "compression")]
+                        let data = DataCompression::decompress(&answer.data)?;
+                        log::trace!(
+                            target: TARGET, 
+                            "RLDP answer {:02x}{:02x}{:02x}{:02x}...", 
+                            data[0], data[1], data[2], data[3]
+                        );
+                        Ok((Some(data), roundtrip))
+                    },
                 Ok(answer) => 
                     fail!("Unexpected answer to RLDP query: {:?}", answer),
                 Err(answer) => 
@@ -1274,14 +1277,14 @@ impl Subscriber for RldpNode {
         };
         match msg {
             RldpMessagePartBoxed::Rldp_Complete(msg) => {
-                if let Some(transfer) = self.transfers.get(&msg.transfer_id.0) {
+                if let Some(transfer) = self.transfers.get(msg.transfer_id.as_slice()) {
                     if let RldpTransfer::Send(transfer) = transfer.val() {
                         transfer.set_part(msg.part as u32 + 1);
                     }
                 }
             },
             RldpMessagePartBoxed::Rldp_Confirm(msg) => {
-                if let Some(transfer) = self.transfers.get(&msg.transfer_id.0) {
+                if let Some(transfer) = self.transfers.get(msg.transfer_id.as_slice()) {
                     if let RldpTransfer::Send(transfer) = transfer.val() {
                         if transfer.part() == msg.part as u32 {
                             transfer.set_seqno_recv(msg.seqno as u32);
@@ -1290,7 +1293,7 @@ impl Subscriber for RldpNode {
                 }
             },
             RldpMessagePartBoxed::Rldp_MessagePart(msg) => {
-                let transfer_id = get256(&msg.transfer_id);
+                let transfer_id = msg.transfer_id.as_slice();
                 loop {
                     let result = if let Some(transfer) = self.transfers.get(transfer_id) {
                         if let RldpTransfer::Recv(queue_sender) = transfer.val() {   
