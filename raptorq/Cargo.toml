@@ -1,9 +1,9 @@
 [package]
-authors = [ 'Christopher Berner <christopherberner@gmail.com>' ]
-description = 'RaptorQ (RFC6330), forked from https://github.com/cberner/raptorq'
 edition = '2018'
 name = 'raptorq'
+description = 'RaptorQ (RFC6330), forked from https://github.com/cberner/raptorq'
 version = '1.2.1'
+authors = [ 'Christopher Berner <christopherberner@gmail.com>' ]
 
 [dependencies]
 serde = { features = [ 'std', 'derive' ], version = '1.0.102' }
@@ -14,25 +14,21 @@ primal = '0.2'
 rand = '0.7'
 threadpool = '1.7'
 
-[features]
+[[bench]]
+name = "codec_benchmark"
+harness = false
+
+[[bench]]
+name = "matrix_sparsity"
+harness = false
+
+[[bench]]
+name = "encode_benchmark"
+harness = false
+
+[[bench]]
+name = "decode_benchmark"
+harness = false
+
+[features]   
 benchmarking = [  ]
-
-[[bench]]
-harness = false
-name = 'codec_benchmark'
-
-
-[[bench]]
-harness = false
-name = 'matrix_sparsity'
-
-
-[[bench]]
-harness = false
-name = 'encode_benchmark'
-
-
-[[bench]]
-harness = false
-name = 'decode_benchmark'
-
