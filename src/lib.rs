@@ -15,22 +15,20 @@ use adnl::{
     declare_counted, dump, 
     common::{
         add_counted_object_to_map, add_unbound_object_to_map, AdnlPeers, CountedObject, 
-        Counter, deserialize, KeyId, Query, QueryId, serialize, serialize_unboxed_inplace, 
-        Subscriber, TaggedByteSlice, Version
+        Counter, Query, QueryId, Subscriber, TaggedByteSlice, Version
     },
-    node::AdnlNode
+    node::{AdnlNode, DataCompression}
 };
 #[cfg(feature = "telemetry")]
-use adnl::{common::{tag_from_unboxed_object, tag_from_unboxed_type}, telemetry::Metric};
-#[cfg(feature = "compression")]
-use adnl::node::DataCompression;
+use adnl::telemetry::Metric;
+use ever_crypto::KeyId;
 use rand::Rng;
 use std::{
     cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, 
     time::{Duration, Instant}
 };
 use ton_api::{
-    IntoBoxed, 
+    deserialize_boxed, IntoBoxed, serialize_bare_inplace, serialize_boxed, 
     ton::{
         self, fec::{Type as FecType, type_::RaptorQ as FecTypeRaptorQ}, 
         rldp::{
@@ -40,6 +38,8 @@ use ton_api::{
         }
     }
 };
+#[cfg(feature = "telemetry")]
+use ton_api::{tag_from_bare_object, tag_from_bare_type};
 use ton_types::{fail, Result, UInt256};
 pub use raptorq;
 
@@ -111,14 +111,14 @@ impl RecvTransfer {
             part: 0
         };
         #[cfg(feature = "telemetry")]
-        let tag_complete = tag_from_unboxed_object(&complete);
+        let tag_complete = tag_from_bare_object(&complete);
         let confirm = RldpConfirm {
             transfer_id: UInt256::with_array(transfer_id),
             part: 0,
             seqno: 0
         };
         #[cfg(feature = "telemetry")]
-        let tag_confirm = tag_from_unboxed_object(&confirm);
+        let tag_confirm = tag_from_bare_object(&confirm);
         Self { 
             buf: Vec::new(),
             complete,
@@ -203,7 +203,7 @@ impl RecvTransfer {
             confirm.part = message.part;
             confirm.seqno = max_seqno as i32;
             self.confirm_count = 0;
-            serialize_unboxed_inplace(&mut self.buf, &self.confirm)?;
+            serialize_bare_inplace(&mut self.buf, &self.confirm)?;
             let ret = TaggedByteSlice {
                 object: &self.buf[..],
                 #[cfg(feature = "telemetry")]
@@ -218,7 +218,7 @@ impl RecvTransfer {
 
     fn build_part_completed_reply(&mut self, part: i32) -> Result<Option<TaggedByteSlice>> {
         self.complete_mut()?.part = part;
-        serialize_unboxed_inplace(&mut self.buf, &self.complete)?;
+        serialize_bare_inplace(&mut self.buf, &self.complete)?;
         let ret = TaggedByteSlice {
             object: &self.buf[..],
             #[cfg(feature = "telemetry")]
@@ -389,8 +389,8 @@ impl <'a> SendTransfer<'a> {
                 }
                 self.state.set_seqno_sent(seqno_sent);
             }
-            serialize_unboxed_inplace(&mut self.buf, &self.message)?;
-            Ok(&self.buf[..])        
+            serialize_bare_inplace(&mut self.buf, &self.message)?;
+            Ok(&self.buf[..])
         } else {
             fail!("Encoder is not ready");
         }
@@ -594,9 +594,9 @@ impl RldpNode {
             subscribers: Arc::new(subscribers),
             transfers: Arc::new(lockfree::map::Map::new()),
             #[cfg(feature = "telemetry")]
-            tag_complete: tag_from_unboxed_type::<RldpComplete>(),
+            tag_complete: tag_from_bare_type::<RldpComplete>(),
             #[cfg(feature = "telemetry")]
-            tag_confirm: tag_from_unboxed_type::<RldpConfirm>(),
+            tag_confirm: tag_from_bare_type::<RldpConfirm>(),
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated
@@ -727,7 +727,7 @@ impl RldpNode {
     ) -> Result<Option<TransferId>> { 
 
         fn deserialize_query(context: &RldpRecvContext) -> Result<RldpQuery> {
-            match deserialize(
+            match deserialize_boxed(
                &context.recv_transfer.data[..]
             )?.downcast::<RldpMessageBoxed>() {
                 Ok(RldpMessageBoxed::Rldp_Query(query)) => Ok(query),
@@ -736,13 +736,12 @@ impl RldpNode {
             }
         }
 
-        #[cfg(not(feature = "compression"))]
-        let query = deserialize_query(context)?;
-        #[cfg(feature = "compression")] 
-        let query = {
-            let mut query = deserialize_query(context)?;
-            query.data = ton::bytes(DataCompression::decompress(&query.data)?);
-            query
+        let mut query = deserialize_query(context)?;
+        let compression = if let Some(data) = DataCompression::decompress(&query.data) {
+            query.data = ton::bytes(data);
+            true
+        } else {
+            context.adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION)
         };
         #[cfg(feature = "telemetry")]
         let query_tag = Self::fetch_tag(&query.data[..]);
@@ -751,15 +750,12 @@ impl RldpNode {
             &query, 
             &context.peers
         ).await? {
-            #[cfg(not(feature = "compression"))] 
-            let answer = if let Some(answer) = answer {
-                answer
-            } else {
-                return Ok(None)
-            };
-            #[cfg(feature = "compression")] 
             let answer = if let Some(mut answer) = answer {
-                answer.object.data = ton::bytes(DataCompression::compress(&answer.object.data)?);
+                if compression {
+                    answer.object.data = ton::bytes(
+                        DataCompression::compress(&answer.object.data)?
+                    );
+                }
                 answer
             } else {
                 return Ok(None)
@@ -774,7 +770,7 @@ impl RldpNode {
         }
         #[cfg(feature = "telemetry")]
         let tag = answer.tag;
-        let data = serialize(&answer.object.into_boxed())?;
+        let data = serialize_boxed(&answer.object.into_boxed())?;
         let mut send_transfer_id = context.transfer_id;
         for x in &mut send_transfer_id {
             *x ^= 0xFF
@@ -885,10 +881,11 @@ impl RldpNode {
         peers: &AdnlPeers,
         roundtrip: Option<u64>
     ) -> Result<(Option<Vec<u8>>, u64)> {  
-        #[cfg(not(feature = "compression"))]
-        let data = query_data.object.to_vec();
-        #[cfg(feature = "compression")]
-        let data = DataCompression::compress(&query_data.object)?;
+        let data = if self.adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION) {
+            DataCompression::compress(&query_data.object)?
+        } else {
+            query_data.object.to_vec()
+        };
         let query_id: QueryId = rand::thread_rng().gen();
         let message = RldpQuery {
             query_id: UInt256::with_array(query_id),
@@ -896,7 +893,7 @@ impl RldpNode {
             timeout: Version::get() + Self::TIMEOUT_MAX as i32/1000,
             data: ton::bytes(data)
         }.into_boxed();
-        let data = serialize(&message)?;
+        let data = serialize_boxed(&message)?;
         let peer = if let Some(peer) = self.peers.get(peers.other()) {
             peer
         } else {
@@ -1027,15 +1024,15 @@ impl RldpNode {
         }
         let (answer, roundtrip) = res?;
         if let Some(answer) = answer {
-            match deserialize(&answer[..])?.downcast::<RldpMessageBoxed>() {
+            match deserialize_boxed(&answer[..])?.downcast::<RldpMessageBoxed>() {
                 Ok(RldpMessageBoxed::Rldp_Answer(answer)) => 
                     if answer.query_id.as_slice() != &query_id {
                         fail!("Unknown query ID in RLDP answer")
                     } else {
-                        #[cfg(not(feature = "compression"))]
-                        let data = answer.data.to_vec();
-                        #[cfg(feature = "compression")]
-                        let data = DataCompression::decompress(&answer.data)?;
+                        let data = match DataCompression::decompress(&answer.data) {
+                            Some(data) => data,
+                            None => answer.data.to_vec() 
+                        };
                         log::trace!(
                             target: TARGET, 
                             "RLDP answer {:02x}{:02x}{:02x}{:02x}...", 
@@ -1265,7 +1262,7 @@ impl Subscriber for RldpNode {
     }
 
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
-        let msg = if let Ok(msg) = deserialize(data) {
+        let msg = if let Ok(msg) = deserialize_boxed(data) {
             msg
         } else {
             return Ok(false)
@@ -1306,7 +1303,7 @@ impl Subscriber for RldpNode {
                             }.into_boxed();
                             self.adnl.send_custom(
                                 &TaggedByteSlice {
-                                    object: &serialize(&reply)?[..], 
+                                    object: &serialize_boxed(&reply)?[..], 
                                     #[cfg(feature = "telemetry")]
                                     tag: self.tag_confirm
                                 },
@@ -1318,7 +1315,7 @@ impl Subscriber for RldpNode {
                             }.into_boxed();
                             self.adnl.send_custom(
                                 &TaggedByteSlice {
-                                    object: &serialize(&reply)?[..], 
+                                    object: &serialize_boxed(&reply)?[..], 
                                     #[cfg(feature = "telemetry")]
                                     tag: self.tag_complete
                                 },
