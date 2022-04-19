@@ -738,6 +738,7 @@ impl RldpNode {
 
         let mut query = deserialize_query(context)?;
         let compression = if let Some(data) = DataCompression::decompress(&query.data) {
+            context.adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION); 
             query.data = ton::bytes(data);
             true
         } else {
@@ -1030,7 +1031,10 @@ impl RldpNode {
                         fail!("Unknown query ID in RLDP answer")
                     } else {
                         let data = match DataCompression::decompress(&answer.data) {
-                            Some(data) => data,
+                            Some(data) => {
+                                self.adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
+                                data
+                            },
                             None => answer.data.to_vec() 
                         };
                         log::trace!(
