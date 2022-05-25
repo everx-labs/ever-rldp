@@ -40,7 +40,7 @@ use ton_api::{
 };
 #[cfg(feature = "telemetry")]
 use ton_api::{tag_from_bare_object, tag_from_bare_type};
-use ton_types::{fail, Result, UInt256};
+use ton_types::{error, fail, Result, UInt256};
 pub use raptorq;
 
 const TARGET: &str = "rldp";
@@ -164,7 +164,9 @@ impl RecvTransfer {
         } else {
             let total_size = message.total_size as usize;
             self.total_size = Some(total_size);
-            self.data.reserve_exact(total_size);
+            self.data.try_reserve_exact(total_size).map_err(
+                |e| error!("RLDP message size {} is too big: {}", total_size, e)
+            )?;
             total_size
         };
         let decoder = match self.part {
