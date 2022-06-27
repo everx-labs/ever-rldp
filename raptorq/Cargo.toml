@@ -8,12 +8,6 @@ authors = [ 'Christopher Berner <christopherberner@gmail.com>' ]
 [dependencies]
 serde = { features = [ 'std', 'derive' ], version = '1.0.102' }
 
-[dev-dependencies]
-criterion = '0.3'
-primal = '0.2'
-rand = '0.7'
-threadpool = '1.7'
-
 [[bench]]
 name = "codec_benchmark"
 harness = false
