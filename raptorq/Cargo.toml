@@ -29,3 +29,4 @@ name = 'encode_benchmark'
 [[bench]]
 harness = false
 name = 'decode_benchmark'
+
