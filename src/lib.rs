@@ -944,7 +944,7 @@ impl RldpNode {
             None, 
             self.allocated.send_transfers.clone()
         );
-        let send_transfer_id = send_transfer.message.transfer_id.inner();
+        let send_transfer_id = send_transfer.message.transfer_id.as_array().clone();
         self.transfers.insert(
             send_transfer_id, 
             RldpTransfer::Send(send_transfer.state.clone())
@@ -1303,7 +1303,7 @@ impl Subscriber for RldpNode {
                             queue_sender.send(msg)
                         } else {
                             let reply = RldpConfirm {
-                                transfer_id: msg.transfer_id,
+                                transfer_id: msg.transfer_id.clone(),
                                 part: msg.part,
                                 seqno: msg.seqno
                             }.into_boxed();
@@ -1316,7 +1316,7 @@ impl Subscriber for RldpNode {
                                 peers.clone(),
                             )?;
                             let reply = RldpComplete {
-                                transfer_id: msg.transfer_id,
+                                transfer_id: msg.transfer_id.clone(),
                                 part: msg.part
                             }.into_boxed();
                             self.adnl.send_custom(
