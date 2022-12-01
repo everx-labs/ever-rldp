@@ -43,6 +43,8 @@ use ton_api::{tag_from_bare_object, tag_from_bare_type};
 use ton_types::{error, fail, Result, UInt256};
 pub use raptorq;
 
+include!("../common/src/info.rs");
+
 const TARGET: &str = "rldp";
 
 type TransferId = [u8; 32];

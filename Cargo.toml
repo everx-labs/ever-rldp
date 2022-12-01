@@ -1,10 +1,9 @@
 [package]
 build = './common/build/build.rs'
 description = 'RLDP library'
-edition = '2018'
+edition = '2021'
 name = 'rldp'
-resolver = '2'
-version = '0.7.100'
+version = '0.7.101'
 
 [workspace]
 
