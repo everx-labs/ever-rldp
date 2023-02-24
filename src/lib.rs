@@ -1150,7 +1150,7 @@ impl RldpNode {
             match context.recv_transfer.process_chunk(job) {
                 Err(e) => log::warn!(target: TARGET, "RLDP error: {}", e),
                 Ok(Some(reply)) => {
-                    if let Err(e) = context.adnl.send_custom(&reply, context.peers.clone()) {
+                    if let Err(e) = context.adnl.send_custom(&reply, &context.peers) {
                         log::warn!(target: TARGET, "RLDP reply error: {}", e)
                     }
                 },
@@ -1213,7 +1213,7 @@ impl RldpNode {
                         #[cfg(feature = "telemetry")]
                         tag: context.tag
                     };
-                    context.adnl.send_custom(&chunk, context.peers.clone())?;
+                    context.adnl.send_custom(&chunk, &context.peers)?;
                     if context.send_transfer.is_finished_or_next_part(part)? {
                         break 'part;
                     }
@@ -1315,7 +1315,7 @@ impl Subscriber for RldpNode {
                                     #[cfg(feature = "telemetry")]
                                     tag: self.tag_confirm
                                 },
-                                peers.clone(),
+                                &peers,
                             )?;
                             let reply = RldpComplete {
                                 transfer_id: msg.transfer_id.clone(),
@@ -1327,7 +1327,7 @@ impl Subscriber for RldpNode {
                                     #[cfg(feature = "telemetry")]
                                     tag: self.tag_complete
                                 },
-                                peers.clone(),
+                                &peers
                             )?;
                             log::info!(
                                 target: TARGET, 
