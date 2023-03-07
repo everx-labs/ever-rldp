@@ -36,5 +36,5 @@ This project output is the library which is used as a part of Everscale/Venom no
 
 Contribution to the project is expected to be done via pull requests submission.
 
-##License:
+License:
 See the [LICENSE](LICENSE) file for details.
