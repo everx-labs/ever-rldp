@@ -21,7 +21,6 @@ use adnl::{
 };
 #[cfg(feature = "telemetry")]
 use adnl::telemetry::Metric;
-use ever_crypto::KeyId;
 use rand::Rng;
 use std::{
     cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, 
@@ -40,7 +39,7 @@ use ton_api::{
 };
 #[cfg(feature = "telemetry")]
 use ton_api::{tag_from_bare_object, tag_from_bare_type};
-use ton_types::{error, fail, Result, UInt256};
+use ton_types::{error, fail, base64_encode, KeyId, Result, UInt256};
 pub use raptorq;
 
 include!("../common/src/info.rs");
@@ -692,7 +691,7 @@ impl RldpNode {
                         log::warn!(
                             target: TARGET, 
                             "ERROR: {}, transfer {}", 
-                            e, base64::encode(&context.transfer_id)
+                            e, base64_encode(&context.transfer_id)
                         );
                         None
                     },
@@ -786,16 +785,16 @@ impl RldpNode {
                 target: TARGET, 
                 "RLDP answer will be sent expired on {} sec in transfer {}/{} to {}",
                 now - query.timeout,
-                base64::encode(&context.transfer_id),
-                base64::encode(&send_transfer_id),
+                base64_encode(&context.transfer_id),
+                base64_encode(&send_transfer_id),
                 context.peers.other()  
             )
         } else {
             log::trace!(
                 target: TARGET, 
                 "RLDP answer to be sent in transfer {}/{} to {}",
-                base64::encode(&context.transfer_id),
-                base64::encode(&send_transfer_id),
+                base64_encode(&context.transfer_id),
+                base64_encode(&send_transfer_id),
                 context.peers.other()  
             )
         }
@@ -822,7 +821,7 @@ impl RldpNode {
             log::trace!(
                 target: TARGET, 
                 "RLDP answer sent in transfer {} to {}",
-                base64::encode(&context.transfer_id),
+                base64_encode(&context.transfer_id),
                 context.peers.other()  
             );
             #[cfg(feature = "telemetry")]
@@ -830,14 +829,14 @@ impl RldpNode {
                 target: TARGET, 
                 "RLDP STAT send: answer on {:x} sent in transfer {} to {}",
                 query_tag,
-                base64::encode(&context.transfer_id),
+                base64_encode(&context.transfer_id),
                 context.peers.other()  
             );
         } else {
             log::warn!(
                 target: TARGET, 
                 "Timeout on answer in RLDP transfer {} to {}", 
-                base64::encode(&context.transfer_id),
+                base64_encode(&context.transfer_id),
                 context.peers.other()  
             );
             #[cfg(feature = "telemetry")]
@@ -845,7 +844,7 @@ impl RldpNode {
                 target: TARGET, 
                 "RLDP STAT send: answer on {:x} timed out in transfer {} to {}",
                 query_tag,
-                base64::encode(&context.transfer_id),
+                base64_encode(&context.transfer_id),
                 context.peers.other()  
             );
         }
@@ -986,8 +985,8 @@ impl RldpNode {
         log::trace!(
             target: TARGET, 
             "transfer id {}/{}, total to send {}", 
-            base64::encode(&send_transfer_id), 
-            base64::encode(&recv_transfer_id), 
+            base64_encode(&send_transfer_id), 
+            base64_encode(&recv_transfer_id), 
             data.len()
         );
         let res = self
@@ -1084,8 +1083,8 @@ impl RldpNode {
             log::trace!(
                 target: TARGET, 
                 "RLDP query sent in transfer {}/{} to {}, waiting for answer",
-                base64::encode(&send_transfer_id),
-                base64::encode(&recv_transfer_id),
+                base64_encode(&send_transfer_id),
+                base64_encode(&recv_transfer_id),
                 peers.other()
             )
         } else {
@@ -1093,8 +1092,8 @@ impl RldpNode {
                 target: TARGET, 
                 "Timeout ({} ms) on query in RLDP transfer {}/{} to {}",
                 timeout,
-                base64::encode(&send_transfer_id),
-                base64::encode(&recv_transfer_id),
+                base64_encode(&send_transfer_id),
+                base64_encode(&recv_transfer_id),
                 peers.other()
             );
             return Ok((None, roundtrip));
@@ -1109,8 +1108,8 @@ impl RldpNode {
                     target: TARGET, 
                     "Recv updates {} -> {} in transfer {}/{}", 
                     updates, new_updates, 
-                    base64::encode(&send_transfer_id),
-                    base64::encode(&recv_transfer_id)
+                    base64_encode(&send_transfer_id),
+                    base64_encode(&recv_transfer_id)
                 );
                 timeout = Self::update_roundtrip(&mut roundtrip, &start_part);
                 updates = new_updates;
@@ -1119,8 +1118,8 @@ impl RldpNode {
                 log::warn!(
                     target: TARGET, 
                     "No activity for transfer {}/{} to {} in {} ms, aborting", 
-                    base64::encode(&send_transfer_id),
-                    base64::encode(&recv_transfer_id),
+                    base64_encode(&send_transfer_id),
+                    base64_encode(&recv_transfer_id),
                     peers.other(),
                     timeout
                 );
@@ -1130,8 +1129,8 @@ impl RldpNode {
                 log::trace!(                  
                     target: TARGET, 
                     "Got reply for transfer {}/{} from {}", 
-                    base64::encode(&send_transfer_id),
-                    base64::encode(&recv_transfer_id),
+                    base64_encode(&send_transfer_id),
+                    base64_encode(&recv_transfer_id),
                     peers.other()
                 );
                 Self::update_roundtrip(&mut roundtrip, &start_part);
@@ -1164,7 +1163,7 @@ impl RldpNode {
                 log::trace!(
                     target: TARGET,
                     "transfer id {}, received first {}, total to receive {:?}",
-                    base64::encode(&context.transfer_id),
+                    base64_encode(&context.transfer_id),
                     context.recv_transfer.data.len(),
                     context.recv_transfer.total_size
                 );              
@@ -1176,7 +1175,7 @@ impl RldpNode {
                     log::trace!(
                         target: TARGET, 
                         "transfer id {}, receive completed ({})",
-                        base64::encode(&context.transfer_id),
+                        base64_encode(&context.transfer_id),
                         total_size,
                     );
                     break
@@ -1227,7 +1226,7 @@ impl RldpNode {
                     log::trace!(
                         target: TARGET, 
                         "Send updates {} -> {} in transfer {}", 
-                        recv_seqno, new_recv_seqno, base64::encode(&context.transfer_id)
+                        recv_seqno, new_recv_seqno, base64_encode(&context.transfer_id)
                     );
                     timeout = Self::update_roundtrip(&mut roundtrip, &start_part);
                     recv_seqno = new_recv_seqno;
@@ -1332,7 +1331,7 @@ impl Subscriber for RldpNode {
                             log::info!(
                                 target: TARGET, 
                                 "Receive update on closed RLDP transfer {}, part {}, seqno {}",
-                                base64::encode(transfer_id), msg.part, msg.seqno
+                                base64_encode(transfer_id), msg.part, msg.seqno
                             );
                             break
                         }
