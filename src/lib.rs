@@ -46,6 +46,40 @@ include!("../common/src/info.rs");
 
 const TARGET: &str = "rldp";
 
+pub struct Constraints {
+    pub data_size: usize,
+    pub symbol_size: usize
+}
+
+impl Constraints {
+
+    pub fn check_fec_type(&self, fec_type: &FecType) -> Result<()> {
+        match fec_type {
+            FecType::Fec_RaptorQ(fec_type) => {
+                if fec_type.symbol_size as usize != self.symbol_size {
+                    fail!("Bad RaptorQ symbol size: {}", fec_type.symbol_size) 
+                }
+                if fec_type.data_size == 0 {
+                    fail!("Empty RaptorQ data payload")
+                }
+                if fec_type.data_size as usize > self.data_size {
+                    fail!("Too big RaptorQ data payload: {}", fec_type.data_size) 
+                }
+            },
+            x => fail!("Bad FEC type {:?}", x)
+        }
+        Ok(())
+    }
+
+    pub fn check_seqno(seqno: u32) -> Result<()> {
+        if (seqno & 0xff000000) != 0 {
+            fail!("RaptorQ seqno is longer than 24 bits: {:x}", seqno)
+        }
+        Ok(())
+    }
+
+}
+
 type TransferId = [u8; 32];
 
 /// RaptorQ decoder
@@ -452,8 +486,11 @@ impl SendTransferState {
     fn seqno_sent(&self) -> u32 {
         self.seqno_sent.load(Ordering::Relaxed)
     }
-    fn set_part(&self, part: u32) {
-        self.part.compare_exchange(part - 1, part, Ordering::Relaxed, Ordering::Relaxed).ok();
+    fn set_next_part(&self, part: u32) {
+        if self.part.compare_exchange(part - 1, part, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            self.seqno_sent.store(0, Ordering::Relaxed);
+            self.seqno_recv.store(0, Ordering::Relaxed);
+        }
     }
     fn set_reply(&self) {
         self.reply.store(true, Ordering::Relaxed)
@@ -854,6 +891,22 @@ impl RldpNode {
 
     fn calc_timeout(roundtrip: Option<u64>) -> u64 {
         max(roundtrip.unwrap_or(Self::TIMEOUT_MAX), Self::TIMEOUT_MIN)
+    }
+
+    fn check_message(message: &RldpMessagePartBoxed) -> Result<()> {
+        const CONSTRAINTS: Constraints = Constraints {
+            data_size: SendTransfer::SLICE,
+            symbol_size: SendTransfer::SYMBOL
+        };
+        let seqno = match message {
+            RldpMessagePartBoxed::Rldp_MessagePart(part) => {
+                CONSTRAINTS.check_fec_type(&part.fec_type)?;
+                part.seqno
+            },
+            RldpMessagePartBoxed::Rldp_Confirm(confirm) => confirm.seqno,
+            RldpMessagePartBoxed::Rldp_Complete(_) => return Ok(())                                                             
+        };
+        Constraints::check_seqno(seqno as u32) 
     }
 
     #[cfg(feature = "telemetry")]
@@ -1279,11 +1332,16 @@ impl Subscriber for RldpNode {
         } else {
             return Ok(false)
         };
+        if let Err(e) = RldpNode::check_message(&msg) {
+            // Ignore invalid messages as early as possible
+            log::warn!(target: TARGET, "Received bad RLDP message. {}", e);
+            return Ok(true)
+        }
         match msg {
             RldpMessagePartBoxed::Rldp_Complete(msg) => {
                 if let Some(transfer) = self.transfers.get(msg.transfer_id.as_slice()) {
                     if let RldpTransfer::Send(transfer) = transfer.val() {
-                        transfer.set_part(msg.part as u32 + 1);
+                        transfer.set_next_part(msg.part as u32 + 1);
                     }
                 }
             },
