@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.7.209
+
+- Added RLPD message sanity check
+
 ## Version 0.7.200
 
 - Do not use base64 and crypto crates directly
