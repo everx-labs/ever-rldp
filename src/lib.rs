@@ -48,23 +48,27 @@ const TARGET: &str = "rldp";
 
 pub struct Constraints {
     pub data_size: usize,
-    pub symbol_size: usize
 }
 
 impl Constraints {
 
+    pub fn check_data_size(&self, data_size: i32) -> Result<()> {
+        if data_size == 0 {
+            fail!("Empty RaptorQ data payload")
+        }
+        if data_size as usize > self.data_size {
+            fail!("Too big RaptorQ data payload: {}", data_size) 
+        }
+        Ok(())
+    }
+
     pub fn check_fec_type(&self, fec_type: &FecType) -> Result<()> {
         match fec_type {
             FecType::Fec_RaptorQ(fec_type) => {
-                if fec_type.symbol_size as usize != self.symbol_size {
+                if fec_type.symbol_size as usize != SendTransfer::SYMBOL {
                     fail!("Bad RaptorQ symbol size: {}", fec_type.symbol_size) 
-                }
-                if fec_type.data_size == 0 {
-                    fail!("Empty RaptorQ data payload")
-                }
-                if fec_type.data_size as usize > self.data_size {
-                    fail!("Too big RaptorQ data payload: {}", fec_type.data_size) 
-                }
+                } 
+                self.check_data_size(fec_type.data_size)?;                                             
             },
             x => fail!("Bad FEC type {:?}", x)
         }
@@ -895,8 +899,7 @@ impl RldpNode {
 
     fn check_message(message: &RldpMessagePartBoxed) -> Result<()> {
         const CONSTRAINTS: Constraints = Constraints {
-            data_size: SendTransfer::SLICE,
-            symbol_size: SendTransfer::SYMBOL
+            data_size: SendTransfer::SLICE
         };
         let seqno = match message {
             RldpMessagePartBoxed::Rldp_MessagePart(part) => {

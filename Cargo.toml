@@ -3,7 +3,7 @@ build = './common/build/build.rs'
 description = 'RLDP library'
 edition = '2021'
 name = 'rldp'
-version = '0.7.209'
+version = '0.7.210'
 
 [dependencies]
 async-trait = '0.1'
