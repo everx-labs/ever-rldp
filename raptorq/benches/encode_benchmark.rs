@@ -1,5 +1,5 @@
 use rand::Rng;
-use raptorq::{SourceBlockEncoder, SourceBlockEncodingPlan};
+use raptorq::{ObjectTransmissionInformation, SourceBlockEncoder, SourceBlockEncodingPlan};
 use std::time::Instant;
 
 const TARGET_TOTAL_BYTES: usize = 128 * 1024 * 1024;
@@ -7,7 +7,7 @@ const SYMBOL_COUNTS: [usize; 10] = [10, 100, 250, 500, 1000, 2000, 5000, 10000, 
 
 fn black_box(value: u64) {
     if value == rand::thread_rng().gen() {
-        println!("{}", value);
+        println!("{value}");
     }
 }
 
@@ -28,11 +28,12 @@ fn benchmark(symbol_size: u16, pre_plan: bool) -> u64 {
 
         let now = Instant::now();
         let iterations = TARGET_TOTAL_BYTES / elements;
+        let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
         for _ in 0..iterations {
             let encoder = if let Some(ref plan) = plan {
-                SourceBlockEncoder::with_encoding_plan(1, symbol_size, &data, plan)
+                SourceBlockEncoder::with_encoding_plan2(1, &config, &data, plan)
             } else {
-                SourceBlockEncoder::new(1, symbol_size, &data)
+                SourceBlockEncoder::new2(1, &config, &data)
             };
             let packets = encoder.repair_packets(0, 1);
             black_box_value += packets[0].data()[0] as u64;
@@ -48,17 +49,14 @@ fn benchmark(symbol_size: u16, pre_plan: bool) -> u64 {
             throughput
         );
     }
-    return black_box_value;
+    black_box_value
 }
 
 fn main() {
     let symbol_size = 1280;
-    println!(
-        "Symbol size: {} bytes (without pre-built plan)",
-        symbol_size
-    );
+    println!("Symbol size: {symbol_size} bytes (without pre-built plan)");
     black_box(benchmark(symbol_size, false));
     println!();
-    println!("Symbol size: {} bytes (with pre-built plan)", symbol_size);
+    println!("Symbol size: {symbol_size} bytes (with pre-built plan)");
     black_box(benchmark(symbol_size, true));
 }

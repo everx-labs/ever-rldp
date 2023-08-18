@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.7.212
+
+- Update raptorQ crate to 1.7.0
+- Increase package version
+- Update CHANGELOG.md file
+
 ## Version 0.7.210
 
 - Refactor RLPD message sanity check

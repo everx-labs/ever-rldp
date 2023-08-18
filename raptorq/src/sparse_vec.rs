@@ -1,9 +1,15 @@
-use crate::octet::Octet;
-use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::mem::size_of;
+#[cfg(feature = "std")]
+use std::{cmp::Ordering, mem::size_of, vec::Vec};
 
-#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize, Hash)]
+#[cfg(not(feature = "std"))]
+use core::{cmp::Ordering, mem::size_of};
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::octet::Octet;
+
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct SparseBinaryVec {
     // Kept sorted by the usize (key). Only ones are stored, zeros are implicit
     elements: Vec<u16>,
@@ -94,7 +100,7 @@ impl SparseBinaryVec {
         }
         self.elements = result;
 
-        column_added
+        return column_added;
     }
 
     pub fn remove(&mut self, i: usize) -> Option<Octet> {

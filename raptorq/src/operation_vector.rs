@@ -1,9 +1,18 @@
+#[cfg(feature = "std")]
+use std::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::octet::Octet;
 use crate::symbol::Symbol;
 use crate::util::get_both_indices;
+#[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
+#[allow(clippy::upper_case_acronyms)]
 pub enum SymbolOps {
     AddAssign {
         dest: usize,
@@ -13,7 +22,7 @@ pub enum SymbolOps {
         dest: usize,
         scalar: Octet,
     },
-    Fma {
+    FMA {
         dest: usize,
         src: usize,
         scalar: Octet,
@@ -32,7 +41,7 @@ pub fn perform_op(op: &SymbolOps, symbols: &mut Vec<Symbol>) {
         SymbolOps::MulAssign { dest, scalar } => {
             symbols[*dest].mulassign_scalar(scalar);
         }
-        SymbolOps::Fma { dest, src, scalar } => {
+        SymbolOps::FMA { dest, src, scalar } => {
             let (dest, temp) = get_both_indices(symbols, *dest, *src);
             dest.fused_addassign_mul_scalar(temp, scalar);
         }

@@ -1,8 +1,19 @@
-use crate::arraymap::{BoolArrayMap, UndirectedGraph};
+#[cfg(feature = "std")]
+use std::{mem, mem::size_of, u16, vec::Vec};
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use core::{mem, mem::size_of, u16};
+
+use crate::arraymap::UndirectedGraph;
 use crate::arraymap::{U16ArrayMap, U32VecMap};
+use crate::graph::ConnectedComponentGraph;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
+use crate::octets::BinaryOctetVec;
 use crate::operation_vector::SymbolOps;
 use crate::symbol::Symbol;
 use crate::systematic_constants::num_hdpc_symbols;
@@ -10,10 +21,14 @@ use crate::systematic_constants::num_intermediate_symbols;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::num_pi_symbols;
 use crate::util::get_both_indices;
-use serde::{Deserialize, Serialize};
-use std::mem::size_of;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
+enum RowOp {
+    AddAssign { src: usize, dest: usize },
+    Swap { row1: usize, row2: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 struct FirstPhaseRowSelectionStats {
     original_degree: U16ArrayMap,
     ones_per_row: U16ArrayMap,
@@ -22,12 +37,18 @@ struct FirstPhaseRowSelectionStats {
     end_col: usize,
     start_row: usize,
     rows_with_single_one: Vec<usize>,
+    // Mapping from columns (graph nodes) to their connected component id for the r = 2 substep
+    col_graph: ConnectedComponentGraph,
 }
 
 impl FirstPhaseRowSelectionStats {
     #[inline(never)]
     #[allow(non_snake_case)]
-    pub fn new<T: BinaryMatrix>(matrix: &T, end_col: usize) -> FirstPhaseRowSelectionStats {
+    pub fn new<T: BinaryMatrix>(
+        matrix: &T,
+        end_col: usize,
+        end_row: usize,
+    ) -> FirstPhaseRowSelectionStats {
         let mut result = FirstPhaseRowSelectionStats {
             original_degree: U16ArrayMap::new(0, 0),
             ones_per_row: U16ArrayMap::new(0, matrix.height()),
@@ -36,6 +57,7 @@ impl FirstPhaseRowSelectionStats {
             end_col,
             start_row: 0,
             rows_with_single_one: vec![],
+            col_graph: ConnectedComponentGraph::new(end_col),
         };
 
         for row in 0..matrix.height() {
@@ -48,6 +70,8 @@ impl FirstPhaseRowSelectionStats {
         }
         // Original degree is the degree of each row before processing begins
         result.original_degree = result.ones_per_row.clone();
+
+        result.rebuild_connected_components(0, end_row, matrix);
 
         result
     }
@@ -75,35 +99,62 @@ impl FirstPhaseRowSelectionStats {
         }
     }
 
+    pub fn swap_columns(&mut self, i: usize, j: usize) {
+        self.col_graph.swap(i, j);
+    }
+
+    // Update the connected component graph, by adding an edge (specified by row)
+    fn add_graph_edge<T: BinaryMatrix>(
+        &mut self,
+        row: usize,
+        matrix: &T,
+        start_col: usize,
+        end_col: usize,
+    ) {
+        let mut ones = [0; 2];
+        let mut found = 0;
+        for (col, value) in matrix.get_row_iter(row, start_col, end_col) {
+            if value == Octet::one() {
+                ones[found] = col;
+                found += 1;
+            }
+            if found == 2 {
+                break;
+            }
+        }
+        assert_eq!(found, 2);
+
+        self.col_graph.add_edge(ones[0], ones[1]);
+    }
+
+    fn remove_graph_edge<T: BinaryMatrix>(&mut self, _row: usize, _matrix: &T) {
+        // No-op. Graph edges are only removed when eliminating an entire connected component.
+        // The effected nodes (cols) will be swapped to the beginning or end of V.
+        // Therefore there is no need to update the connected component graph
+    }
+
     // Recompute all stored statistics for the given row
     pub fn recompute_row<T: BinaryMatrix>(&mut self, row: usize, matrix: &T) {
         let ones = matrix.count_ones(row, self.start_col, self.end_col);
-        self.rows_with_single_one.retain(|x| *x != row);
+        if let Some(index) = self.rows_with_single_one.iter().position(|x| *x == row) {
+            self.rows_with_single_one.swap_remove(index);
+        }
         if ones == 1 {
             self.rows_with_single_one.push(row);
         }
         self.ones_histogram
             .decrement(self.ones_per_row.get(row) as usize);
         self.ones_histogram.increment(ones);
-        self.ones_per_row.insert(row, ones as u16);
-    }
-
-    pub fn eliminate_leading_value(&mut self, row: usize, value: &Octet) {
-        debug_assert_ne!(*value, Octet::zero());
-        debug_assert_eq!(*value, Octet::one());
-        self.ones_per_row.decrement(row);
-        let ones = self.ones_per_row.get(row);
-        if ones == 0 {
-            self.rows_with_single_one.retain(|x| *x != row);
-        } else if ones == 1 {
-            self.rows_with_single_one.push(row);
+        if self.ones_per_row.get(row) == 2 {
+            self.remove_graph_edge(row, matrix);
         }
-        self.ones_histogram.decrement((ones + 1) as usize);
-        self.ones_histogram.increment(ones as usize);
+        self.ones_per_row.insert(row, ones as u16);
+        if ones == 2 {
+            self.add_graph_edge(row, matrix, self.start_col, self.end_col);
+        }
     }
 
     // Set the valid columns, and recalculate statistics
-    // All values in column "start_col - 1" in rows start_row..end_row must be zero
     #[inline(never)]
     pub fn resize<T: BinaryMatrix>(
         &mut self,
@@ -111,6 +162,8 @@ impl FirstPhaseRowSelectionStats {
         end_row: usize,
         start_col: usize,
         end_col: usize,
+        // Ones from start_row to end_row, i.e. matrix.get_ones_in_column(self.start_col, start_row, end_row)
+        ones_in_start_col: &[u32],
         matrix: &T,
     ) {
         // Only shrinking is supported
@@ -118,22 +171,69 @@ impl FirstPhaseRowSelectionStats {
         assert_eq!(self.start_row, start_row - 1);
         assert_eq!(self.start_col, start_col - 1);
 
-        self.ones_histogram
-            .decrement(self.ones_per_row.get(self.start_row) as usize);
-        self.rows_with_single_one.retain(|x| *x != start_row - 1);
+        // Remove this separately, since it's not part of ones_in_start_col
+        if matrix.get(self.start_row, self.start_col) == Octet::one() {
+            let row = self.start_row;
+            self.ones_per_row.decrement(row);
+            let ones = self.ones_per_row.get(row);
+            if ones == 0 {
+                if let Some(index) = self.rows_with_single_one.iter().position(|x| *x == row) {
+                    self.rows_with_single_one.swap_remove(index);
+                }
+            } else if ones == 1 {
+                self.remove_graph_edge(row, matrix);
+            }
+            self.ones_histogram.decrement((ones + 1) as usize);
+            self.ones_histogram.increment(ones as usize);
+        }
+
+        let mut possible_new_graph_edges = vec![];
+        for &row in ones_in_start_col {
+            let row = row as usize;
+            self.ones_per_row.decrement(row);
+            let ones = self.ones_per_row.get(row);
+            if ones == 0 {
+                if let Some(index) = self.rows_with_single_one.iter().position(|x| *x == row) {
+                    self.rows_with_single_one.swap_remove(index);
+                }
+            } else if ones == 1 {
+                self.rows_with_single_one.push(row);
+                self.remove_graph_edge(row, matrix);
+            }
+            if ones == 2 {
+                possible_new_graph_edges.push(row);
+            }
+            self.ones_histogram.decrement((ones + 1) as usize);
+            self.ones_histogram.increment(ones as usize);
+        }
+
+        self.col_graph.remove_node(start_col - 1);
 
         for col in end_col..self.end_col {
-            for row in matrix.get_ones_in_column(col, start_row, end_row) {
+            for row in matrix.get_ones_in_column(col, self.start_row, end_row) {
                 let row = row as usize;
                 self.ones_per_row.decrement(row);
                 let ones = self.ones_per_row.get(row);
                 if ones == 0 {
-                    self.rows_with_single_one.retain(|x| *x != row);
+                    if let Some(index) = self.rows_with_single_one.iter().position(|x| *x == row) {
+                        self.rows_with_single_one.swap_remove(index);
+                    }
                 } else if ones == 1 {
                     self.rows_with_single_one.push(row);
+                    self.remove_graph_edge(row, matrix);
+                }
+                if ones == 2 {
+                    possible_new_graph_edges.push(row);
                 }
                 self.ones_histogram.decrement((ones + 1) as usize);
                 self.ones_histogram.increment(ones as usize);
+            }
+            self.col_graph.remove_node(col);
+        }
+
+        for row in possible_new_graph_edges {
+            if self.ones_per_row.get(row) == 2 {
+                self.add_graph_edge(row, matrix, start_col, end_col);
             }
         }
 
@@ -180,7 +280,39 @@ impl FirstPhaseRowSelectionStats {
             graph.add_edge(ones[0] as u16, ones[1] as u16);
         }
         graph.build();
-        graph
+        return graph;
+    }
+
+    #[inline(never)]
+    fn rebuild_connected_components<T: BinaryMatrix>(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+        matrix: &T,
+    ) {
+        // Reset connected component structures
+        self.col_graph.reset();
+
+        let graph = self.first_phase_graph_substep_build_adjacency(start_row, end_row, matrix);
+
+        let mut node_queue = Vec::with_capacity(10);
+        for key in graph.nodes() {
+            let connected_component_id = self.col_graph.create_connected_component();
+            // Pick arbitrary node (column) to start
+            node_queue.clear();
+            node_queue.push(key);
+            while !node_queue.is_empty() {
+                let node = node_queue.pop().unwrap();
+                if self.col_graph.contains(node as usize) {
+                    continue;
+                }
+                self.col_graph
+                    .add_node(node as usize, connected_component_id);
+                for next_node in graph.get_adjacent_nodes(node) {
+                    node_queue.push(next_node);
+                }
+            }
+        }
     }
 
     #[inline(never)]
@@ -190,41 +322,13 @@ impl FirstPhaseRowSelectionStats {
         end_row: usize,
         matrix: &T,
     ) -> usize {
-        let graph = self.first_phase_graph_substep_build_adjacency(start_row, end_row, matrix);
-        let mut visited = BoolArrayMap::new(start_row, end_row);
+        // Find a node (col) in the largest connected component
+        let node = self
+            .col_graph
+            .get_node_in_largest_connected_component(self.start_col, self.end_col);
 
-        let mut examplar_largest_component_node = None;
-        let mut largest_component_size = 0;
-
-        let mut node_queue = Vec::with_capacity(10);
-        for key in graph.nodes() {
-            let mut component_size = 0;
-            // We can choose any edge (row) that connects this col to another in the graph
-            let mut examplar_node = None;
-            // Pick arbitrary node (column) to start
-            node_queue.clear();
-            node_queue.push(key);
-            while !node_queue.is_empty() {
-                let node = node_queue.pop().unwrap();
-                if visited.get(node as usize) {
-                    continue;
-                }
-                visited.insert(node as usize, true);
-                component_size += 1;
-                for next_node in graph.get_adjacent_nodes(node) {
-                    node_queue.push(next_node);
-                    examplar_node = Some(node);
-                }
-            }
-
-            if component_size > largest_component_size {
-                examplar_largest_component_node = examplar_node;
-                largest_component_size = component_size;
-            }
-
-        }
-        let node = examplar_largest_component_node.unwrap();
-        for row in matrix.get_ones_in_column(node as usize, start_row, end_row) {
+        // Find a row with two ones in the given column
+        for row in matrix.get_ones_in_column(node, start_row, end_row) {
             let row = row as usize;
             if self.ones_per_row.get(row) == 2 {
                 return row;
@@ -243,14 +347,13 @@ impl FirstPhaseRowSelectionStats {
         // There's no need for special handling of HDPC rows, since Errata 2 guarantees we won't
         // select any, and they're excluded in the first_phase solver
         let mut chosen = None;
-        let mut chosen_original_degree = std::u16::MAX;
+        let mut chosen_original_degree = u16::MAX;
         // Fast path for r=1, since this is super common
         if r == 1 {
             assert_ne!(0, self.rows_with_single_one.len());
             for &row in self.rows_with_single_one.iter() {
-                let ones = self.ones_per_row.get(row);
                 let row_original_degree = self.original_degree.get(row);
-                if ones as usize == r && row_original_degree < chosen_original_degree {
+                if row_original_degree < chosen_original_degree {
                     chosen = Some(row);
                     chosen_original_degree = row_original_degree;
                 }
@@ -265,7 +368,7 @@ impl FirstPhaseRowSelectionStats {
                 }
             }
         }
-        chosen.unwrap()
+        return chosen.unwrap();
     }
 
     // Verify there there are no non-HPDC rows with exactly two non-zero entries, greater than one
@@ -297,7 +400,7 @@ impl FirstPhaseRowSelectionStats {
             }
         }
 
-        if r == None {
+        if r.is_none() {
             return (None, None);
         }
 
@@ -309,22 +412,25 @@ impl FirstPhaseRowSelectionStats {
             #[cfg(debug_assertions)]
             self.first_phase_graph_substep_verify(start_row, end_row);
             let row = self.first_phase_graph_substep(start_row, end_row, matrix);
-            (Some(row), r)
+            return (Some(row), r);
         } else {
             let row = self.first_phase_original_degree_substep(start_row, end_row, r.unwrap());
-            (Some(row), r)
+            return (Some(row), r);
         }
     }
 }
 
 // See section 5.4.2.1
 #[allow(non_snake_case)]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct IntermediateSymbolDecoder<T: BinaryMatrix> {
     A: T,
     // If present, these are treated as replacing the last rows of A
     // Errata 3 guarantees that these do not need to be included in X
     A_hdpc_rows: Option<DenseOctetMatrix>,
+    // Due to Errata 9 & 10 we only store the X matrix for debug builds to verify the results,
+    // since it's not actually needed
+    #[cfg(debug_assertions)]
     X: T,
     D: Vec<Symbol>,
     c: Vec<usize>,
@@ -365,16 +471,20 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         let num_rows = matrix.height();
 
         let pi_symbols = num_pi_symbols(num_source_symbols) as usize;
-        let mut A = matrix.clone();
-        A.enable_column_acccess_acceleration();
-        let mut X = matrix;
+        #[cfg(debug_assertions)]
+        let mut X = matrix.clone();
         // Drop the PI symbols, since they will never be accessed in X. X will be resized to
         // i-by-i in the second phase.
+        #[cfg(debug_assertions)]
         X.resize(X.height(), X.width() - pi_symbols);
+
+        let mut A = matrix;
+        A.enable_column_access_acceleration();
 
         let mut temp = IntermediateSymbolDecoder {
             A,
             A_hdpc_rows: None,
+            #[cfg(debug_assertions)]
             X,
             D: symbols,
             c,
@@ -396,6 +506,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         // See section 5.3.3.4.2, Figure 5.
         for i in 0..H {
             temp.swap_rows(S + i, num_rows - H + i);
+            #[cfg(debug_assertions)]
             temp.X.swap_rows(S + i, num_rows - H + i);
         }
 
@@ -415,7 +526,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 SymbolOps::MulAssign { dest, scalar } => {
                     self.D[*dest].mulassign_scalar(scalar);
                 }
-                SymbolOps::Fma { dest, src, scalar } => {
+                SymbolOps::FMA { dest, src, scalar } => {
                     let (dest, temp) = get_both_indices(&mut self.D, *dest, *src);
                     dest.fused_addassign_mul_scalar(temp, scalar);
                 }
@@ -441,7 +552,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 }
             }
         }
-        true
+        return true;
     }
 
     #[cfg(debug_assertions)]
@@ -451,68 +562,94 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 return hdpc.get(row - (self.A.height() - hdpc.height()), col);
             }
         }
-        self.A.get(row, col)
+        return self.A.get(row, col);
     }
 
     // Performs the column swapping substep of first phase, after the row has been chosen
     #[inline(never)]
-    fn first_phase_swap_columns_substep(&mut self, r: usize) {
-        let mut swapped_columns = 0;
+    fn first_phase_swap_columns_substep(
+        &mut self,
+        r: usize,
+        selection_helper: &mut FirstPhaseRowSelectionStats,
+    ) {
         // Fast path when r == 1, since this is very common
         if r == 1 {
             // self.i will never reference an HDPC row, so can ignore self.A_hdpc_rows
             // because of Errata 2.
-            for (col, value) in self
+            let col = self
                 .A
                 .get_row_iter(self.i, self.i, self.A.width() - self.u)
-                .clone()
-            {
-                if value != Octet::zero() {
-                    // No need to swap the first i rows, as they are all zero (see submatrix above V)
-                    self.swap_columns(self.i, col, self.i);
-                    // Also apply to X
-                    self.X.swap_columns(self.i, col, 0);
-                    swapped_columns += 1;
-                    break;
+                .find_map(|(col, value)| {
+                    if value != Octet::zero() {
+                        Some(col)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            // No need to swap the first i rows, as they are all zero (see submatrix above V)
+            self.swap_columns(self.i, col, self.i);
+            selection_helper.swap_columns(self.i, col);
+            // Also apply to X
+            #[cfg(debug_assertions)]
+            self.X.swap_columns(self.i, col, 0);
+            return;
+        }
+
+        let mut remaining_swaps = r;
+        let mut found_first = self.A.get(self.i, self.i) == Octet::one();
+        // self.i will never reference an HDPC row, so can ignore self.A_hdpc_rows
+        // because of Errata 2.
+        for (col, value) in self
+            .A
+            .get_row_iter(self.i, self.i, self.A.width() - self.u)
+            .clone()
+        {
+            if value == Octet::zero() {
+                continue;
+            }
+            if col >= self.A.width() - self.u - (r - 1) {
+                // Skip the column, if it's one of the trailing columns that shouldn't move
+                remaining_swaps -= 1;
+                continue;
+            }
+            if col == self.i {
+                // Skip the column, if it's already in the first position
+                remaining_swaps -= 1;
+                found_first = true;
+                continue;
+            }
+            let mut dest;
+            if !found_first {
+                dest = self.i;
+                found_first = true;
+            } else {
+                dest = self.A.width() - self.u - 1;
+                // Some of the right most columns may already contain non-zeros
+                while self.A.get(self.i, dest) != Octet::zero() {
+                    dest -= 1;
                 }
             }
-        } else {
-            for col in self.i..(self.A.width() - self.u) {
-                // self.i will never reference an HDPC row, so can ignore self.A_hdpc_rows
-                // because of Errata 2.
-                if self.A.get(self.i, col) != Octet::zero() {
-                    let mut dest;
-                    if swapped_columns == 0 {
-                        dest = self.i;
-                    } else {
-                        dest = self.A.width() - self.u - swapped_columns;
-                        // Some of the right most columns may already contain non-zeros
-                        while self.A.get(self.i, dest) != Octet::zero() {
-                            dest -= 1;
-                            swapped_columns += 1;
-                        }
-                    }
-                    if swapped_columns == r {
-                        break;
-                    }
-                    // No need to swap the first i rows, as they are all zero (see submatrix above V)
-                    self.swap_columns(dest, col, self.i);
-                    // Also apply to X
-                    self.X.swap_columns(dest, col, 0);
-                    swapped_columns += 1;
-                    if swapped_columns == r {
-                        break;
-                    }
-                }
+            // No need to swap the first i rows, as they are all zero (see submatrix above V)
+            self.swap_columns(dest, col, self.i);
+            selection_helper.swap_columns(dest, col);
+            // Also apply to X
+            #[cfg(debug_assertions)]
+            self.X.swap_columns(dest, col, 0);
+            remaining_swaps -= 1;
+            if remaining_swaps == 0 {
+                break;
             }
         }
-        assert_eq!(r, swapped_columns);
+        assert_eq!(0, remaining_swaps);
     }
 
     // First phase (section 5.4.2.2)
+    //
+    // Returns the row operations required to convert the X matrix into the identity
     #[allow(non_snake_case)]
     #[inline(never)]
-    fn first_phase(&mut self) -> bool {
+    fn first_phase(&mut self) -> Option<Vec<RowOp>> {
         // First phase (section 5.4.2.2)
 
         //    ----------> i                 u <--------
@@ -531,11 +668,16 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
 
         let num_hdpc_rows = self.A_hdpc_rows.as_ref().unwrap().height();
 
-        let mut selection_helper =
-            FirstPhaseRowSelectionStats::new(&self.A, self.A.width() - self.u);
+        let mut selection_helper = FirstPhaseRowSelectionStats::new(
+            &self.A,
+            self.A.width() - self.u,
+            self.A.height() - num_hdpc_rows,
+        );
+
+        // Record of first phase row operations performed on non-HDPC rows
+        let mut row_ops = vec![];
 
         while self.i + self.u < self.L {
-
             // Calculate r
             // "Let r be the minimum integer such that at least one row of A has
             // exactly r nonzeros in V."
@@ -546,10 +688,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 &self.A,
             );
 
-            if r == None {
-                return false;
-            }
-
+            r?;
             let r = r.unwrap();
             let chosen_row = chosen_row.unwrap();
             assert!(chosen_row >= self.i);
@@ -558,42 +697,54 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
             // Reorder rows
             let temp = self.i;
             self.swap_rows(temp, chosen_row);
+            #[cfg(debug_assertions)]
             self.X.swap_rows(temp, chosen_row);
+            row_ops.push(RowOp::Swap {
+                row1: temp,
+                row2: chosen_row,
+            });
             selection_helper.swap_rows(temp, chosen_row);
             // Reorder columns
-            self.first_phase_swap_columns_substep(r);
+            self.first_phase_swap_columns_substep(r, &mut selection_helper);
             // Zero out leading value in following rows
             let temp = self.i;
             // self.i will never reference an HDPC row, so can ignore self.A_hdpc_rows
             // because of Errata 2.
             let temp_value = self.A.get(temp, temp);
 
-            for i in 0..(r - 1) {
+            let ones_in_column =
                 self.A
-                    .hint_column_dense_and_frozen(self.A.width() - self.u - 1 - i);
-            }
+                    .get_ones_in_column(temp, self.i + 1, self.A.height() - num_hdpc_rows);
             selection_helper.resize(
                 self.i + 1,
                 self.A.height() - self.A_hdpc_rows.as_ref().unwrap().height(),
                 self.i + 1,
                 self.A.width() - self.u - (r - 1),
+                &ones_in_column,
                 &self.A,
             );
+            for i in 0..(r - 1) {
+                self.A
+                    .hint_column_dense_and_frozen(self.A.width() - self.u - 1 - i);
+            }
 
-            // Cloning the iterator is safe here, because we don't re-read any of the rows that
-            // we add to
-            for row in self
-                .A
-                .get_ones_in_column(temp, self.i + 1, self.A.height() - num_hdpc_rows)
-            {
+            // Skip the first element since that's the i'th row
+            for row in ones_in_column {
                 let row = row as usize;
                 assert_eq!(&temp_value, &Octet::one());
                 // Addition is equivalent to subtraction.
-                self.fma_rows(temp, row, Octet::one());
+                #[cfg(debug_assertions)]
+                self.fma_rows(temp, row, Octet::one(), 0);
+                // Only apply to U section of matrix due to Errata 11
+                #[cfg(not(debug_assertions))]
+                self.fma_rows(temp, row, Octet::one(), self.A.width() - (self.u + (r - 1)));
+                row_ops.push(RowOp::AddAssign {
+                    src: temp,
+                    dest: row,
+                });
                 if r == 1 {
-                    // Hot path for r == 1, since it's very common due to maximum connected
-                    // component selection, and recompute_row() is expensive
-                    selection_helper.eliminate_leading_value(row, &Octet::one());
+                    // No need to update the selection helper, since we already resized it to remove
+                    // the first column
                 } else {
                     selection_helper.recompute_row(row, &self.A);
                 }
@@ -616,6 +767,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                         // since all the rest were column swapped into the PI submatrix.
                         Some(temp),
                         Some(&pi_octets),
+                        0,
                     );
                     // It's safe to skip updating the selection helper, since it will never
                     // select an HDPC row
@@ -629,7 +781,31 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         }
 
         self.record_symbol_ops(0);
-        true
+
+        let mut mapping: Vec<usize> = (0..self.A.height()).collect();
+        let mut row_ops: Vec<RowOp> = row_ops
+            .iter()
+            .rev()
+            .filter_map(|x| match x {
+                RowOp::AddAssign { src, dest } => {
+                    assert!(mapping[*src] < self.i);
+                    if mapping[*src] < self.i && mapping[*dest] < self.i {
+                        Some(RowOp::AddAssign {
+                            src: mapping[*src],
+                            dest: mapping[*dest],
+                        })
+                    } else {
+                        None
+                    }
+                }
+                RowOp::Swap { row1, row2 } => {
+                    mapping.swap(*row1, *row2);
+                    None
+                }
+            })
+            .collect();
+        row_ops.reverse();
+        return Some(row_ops);
     }
 
     // See section 5.4.2.2. Verifies the two all-zeros submatrices and the identity submatrix
@@ -652,10 +828,11 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
     // Second phase (section 5.4.2.3)
     #[allow(non_snake_case)]
     #[inline(never)]
-    fn second_phase(&mut self) -> bool {
+    fn second_phase(&mut self, #[allow(unused_variables)] x_elimination_ops: &[RowOp]) -> bool {
         #[cfg(debug_assertions)]
-        self.second_phase_verify();
+        self.second_phase_verify(x_elimination_ops);
 
+        #[cfg(debug_assertions)]
         self.X.resize(self.i, self.i);
 
         // Convert U_lower to row echelon form
@@ -673,16 +850,36 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         self.A.resize(self.L, self.L);
 
         self.record_symbol_ops(1);
-        true
+        return true;
     }
 
     // Verifies that X is lower triangular. See section 5.4.2.3
     #[inline(never)]
     #[cfg(debug_assertions)]
-    fn second_phase_verify(&self) {
+    fn second_phase_verify(&self, x_elimination_ops: &[RowOp]) {
         for row in 0..self.i {
             for col in (row + 1)..self.i {
                 assert_eq!(Octet::zero(), self.X.get(row, col));
+            }
+        }
+
+        // Also verify Errata 9
+        let mut tempX = self.X.clone();
+        for op in x_elimination_ops {
+            match op {
+                RowOp::AddAssign { src, dest } => {
+                    tempX.add_assign_rows(*dest, *src, 0);
+                }
+                RowOp::Swap { .. } => unreachable!(),
+            }
+        }
+        for row in 0..self.i {
+            for col in 0..self.i {
+                if row == col {
+                    assert_eq!(Octet::one(), tempX.get(row, col));
+                } else {
+                    assert_eq!(Octet::zero(), tempX.get(row, col));
+                }
             }
         }
     }
@@ -690,43 +887,21 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
     // Third phase (section 5.4.2.4)
     #[allow(non_snake_case)]
     #[inline(never)]
-    fn third_phase(&mut self) {
+    fn third_phase(&mut self, x_elimination_ops: &[RowOp]) {
         #[cfg(debug_assertions)]
         self.third_phase_verify();
 
-        // A[0..i][..] = X * A[0..i][..]
-        self.A.mul_assign_submatrix(&self.X, self.i);
-
-        // Now apply the same operations to D.
-        // Note that X is lower triangular, so the row must be processed last to first
-        for row in (0..self.i).rev() {
-            if self.X.get(row, row) != Octet::one() {
-                self.debug_symbol_mul_ops += 1;
-                self.deferred_D_ops.push(SymbolOps::MulAssign {
-                    dest: self.d[row],
-                    scalar: self.X.get(row, row),
-                });
-            }
-
-            for (col, value) in self.X.get_row_iter(row, 0, row) {
-                if value == Octet::zero() {
-                    continue;
+        // Perform A[0..i][..] = X * A[0..i][..] by applying Errata 10
+        for op in x_elimination_ops.iter().rev() {
+            match op {
+                RowOp::AddAssign { src, dest } => {
+                    #[cfg(debug_assertions)]
+                    self.fma_rows(*src, *dest, Octet::one(), 0);
+                    #[cfg(not(debug_assertions))]
+                    // Skip applying to cols before i due to Errata 11
+                    self.fma_rows(*src, *dest, Octet::one(), self.i);
                 }
-                if value == Octet::one() {
-                    self.debug_symbol_add_ops += 1;
-                    self.deferred_D_ops.push(SymbolOps::AddAssign {
-                        dest: self.d[row],
-                        src: self.d[col],
-                    });
-                } else {
-                    self.debug_symbol_mul_ops += 1;
-                    self.debug_symbol_add_ops += 1;
-                    self.deferred_D_ops.push(SymbolOps::Fma {
-                        dest: self.d[row],
-                        src: self.d[col],
-                        scalar: self.X.get(row, col),
-                    });
-                }
+                RowOp::Swap { .. } => unreachable!(),
             }
         }
 
@@ -770,12 +945,12 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
     #[inline(never)]
     fn fourth_phase(&mut self) {
         for i in 0..self.i {
-            for j in 0..self.u {
-                let b = self.A.get(i, j + self.i);
-                if b != Octet::zero() {
-                    let temp = self.i;
-                    self.fma_rows(temp + j, i, b);
-                }
+            for j in self.A.query_non_zero_columns(i, self.i) {
+                #[cfg(debug_assertions)]
+                self.fma_rows(j, i, Octet::one(), 0);
+                // Skip applying to cols before i due to Errata 11
+                #[cfg(not(debug_assertions))]
+                self.fma_rows(j, i, Octet::one(), self.i);
             }
         }
 
@@ -800,7 +975,6 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         //  | |           |        |
         //    +-----------+--------+
         // Same assertion about X being equal to the upper left of A
-        #[cfg(debug_assertions)]
         self.third_phase_verify_end();
         assert!(self.all_zeroes(0, self.i, self.A.width() - self.u, self.A.width()));
         assert!(self.all_zeroes(self.A.height() - self.u, self.A.height(), 0, self.i));
@@ -818,20 +992,18 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
     // Fifth phase (section 5.4.2.6)
     #[allow(non_snake_case)]
     #[inline(never)]
-    fn fifth_phase(&mut self) {
-        // "For j from 1 to i". Note that A is 1-indexed in the spec, and ranges are inclusive,
-        // this is means [1, i], which is equal to [0, i)
-        for j in 0..self.i as usize {
-            // Skip normalizing the diagonal, since there can't be non-binary values due to
-            // Errata 7
-
-            // "For l from 1 to j-1". This means the lower triangular columns, not including the
-            // diagonal, which is [0, j)
-            for (l, _) in self.A.get_row_iter(j, 0, j).clone() {
-                let temp = self.A.get(j, l);
-                if temp != Octet::zero() {
-                    self.fma_rows(l, j, temp);
+    fn fifth_phase(&mut self, x_elimination_ops: &[RowOp]) {
+        // Use the saved operations from first phase: Errata 9
+        for op in x_elimination_ops {
+            match op {
+                RowOp::AddAssign { src, dest } => {
+                    #[cfg(debug_assertions)]
+                    self.fma_rows(*src, *dest, Octet::one(), 0);
+                    // In release builds skip updating the A matrix, since it will never be read
+                    #[cfg(not(debug_assertions))]
+                    self.record_fma_rows(*src, *dest, Octet::one());
                 }
+                RowOp::Swap { .. } => unreachable!(),
             }
         }
 
@@ -928,7 +1100,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
             }
         }
 
-        Some(submatrix)
+        return Some(submatrix);
     }
 
     // Performs backwards elimination in a size x size submatrix, starting at
@@ -997,7 +1169,10 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         if let Some(ref hdpc) = self.A_hdpc_rows {
             bytes += hdpc.size_in_bytes();
         }
-        bytes += self.X.size_in_bytes();
+        #[cfg(debug_assertions)]
+        {
+            bytes += self.X.size_in_bytes();
+        }
         // Skip self.D, since we're calculating non-Symbol bytes
         bytes += size_of::<usize>() * self.c.len();
         bytes += size_of::<usize>() * self.d.len();
@@ -1015,8 +1190,8 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         assert!(self.A_hdpc_rows.is_none());
     }
 
-    fn fma_rows(&mut self, i: usize, iprime: usize, beta: Octet) {
-        self.fma_rows_with_pi(i, iprime, beta, None, None);
+    fn fma_rows(&mut self, i: usize, iprime: usize, beta: Octet, start_col: usize) {
+        self.fma_rows_with_pi(i, iprime, beta, None, None, start_col);
     }
 
     fn record_fma_rows(&mut self, i: usize, iprime: usize, beta: Octet) {
@@ -1028,7 +1203,7 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
             });
         } else {
             self.debug_symbol_mul_ops += 1;
-            self.deferred_D_ops.push(SymbolOps::Fma {
+            self.deferred_D_ops.push(SymbolOps::FMA {
                 dest: self.d[iprime],
                 src: self.d[i],
                 scalar: beta,
@@ -1041,8 +1216,9 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
         i: usize,
         iprime: usize,
         beta: Octet,
-        only_non_pi_nonzero_column: Option<usize>,
-        pi_octets: Option<&Vec<u8>>,
+        #[allow(unused_variables)] only_non_pi_nonzero_column: Option<usize>,
+        pi_octets: Option<&BinaryOctetVec>,
+        start_col: usize,
     ) {
         self.record_fma_rows(i, iprime, beta.clone());
 
@@ -1051,11 +1227,15 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
             // Adding HDPC rows to other rows isn't supported, since it should never happen
             assert!(i < first_hdpc_row);
             if iprime >= first_hdpc_row {
-                let col = only_non_pi_nonzero_column.unwrap();
-                let multiplicand = self.A.get(i, col);
-                let mut value = hdpc.get(iprime - first_hdpc_row, col);
-                value.fma(&multiplicand, &beta);
-                hdpc.set(iprime - first_hdpc_row, col, value);
+                // Only update the V section of HDPC rows, for debugging. (they will never be read)
+                #[cfg(debug_assertions)]
+                {
+                    let col = only_non_pi_nonzero_column.unwrap();
+                    let multiplicand = self.A.get(i, col);
+                    let mut value = hdpc.get(iprime - first_hdpc_row, col);
+                    value.fma(&multiplicand, &beta);
+                    hdpc.set(iprime - first_hdpc_row, col, value);
+                }
 
                 // Handle this part separately, since it's in the dense U part of the matrix
                 let octets = pi_octets.unwrap();
@@ -1067,11 +1247,11 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
                 );
             } else {
                 assert_eq!(&beta, &Octet::one());
-                self.A.add_assign_rows(iprime, i);
+                self.A.add_assign_rows(iprime, i, start_col);
             }
         } else {
             assert_eq!(&beta, &Octet::one());
-            self.A.add_assign_rows(iprime, i);
+            self.A.add_assign_rows(iprime, i, start_col);
         }
     }
 
@@ -1096,21 +1276,22 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
 
     #[inline(never)]
     pub fn execute(&mut self) -> (Option<Vec<Symbol>>, Option<Vec<SymbolOps>>) {
-        self.X.disable_column_acccess_acceleration();
+        #[cfg(debug_assertions)]
+        self.X.disable_column_access_acceleration();
 
-        if !self.first_phase() {
+        if let Some(x_elimination_ops) = self.first_phase() {
+            self.A.disable_column_access_acceleration();
+
+            if !self.second_phase(&x_elimination_ops) {
+                return (None, None);
+            }
+
+            self.third_phase(&x_elimination_ops);
+            self.fourth_phase();
+            self.fifth_phase(&x_elimination_ops);
+        } else {
             return (None, None);
         }
-
-        self.A.disable_column_acccess_acceleration();
-
-        if !self.second_phase() {
-            return (None, None);
-        }
-
-        self.third_phase();
-        self.fourth_phase();
-        self.fifth_phase();
 
         self.apply_deferred_symbol_ops();
 
@@ -1136,9 +1317,9 @@ impl<T: BinaryMatrix> IntermediateSymbolDecoder<T> {
             reorder.push(*i);
         }
 
-        let mut operation_vector = std::mem::take(&mut self.deferred_D_ops);
+        let mut operation_vector = mem::take(&mut self.deferred_D_ops);
         operation_vector.push(SymbolOps::Reorder { order: reorder });
-        (Some(result), Some(operation_vector))
+        return (Some(result), Some(operation_vector));
     }
 }
 
