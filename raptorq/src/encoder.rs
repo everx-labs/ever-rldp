@@ -1,3 +1,9 @@
+#[cfg(feature = "std")]
+use std::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::base::intermediate_tuple;
 use crate::base::partition;
 use crate::base::EncodingPacket;
@@ -15,82 +21,136 @@ use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::num_lt_symbols;
 use crate::systematic_constants::num_pi_symbols;
 use crate::systematic_constants::{calculate_p1, systematic_index};
+use crate::util::int_div_ceil;
 use crate::ObjectTransmissionInformation;
+#[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 
 pub const SPARSE_MATRIX_THRESHOLD: u32 = 250;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
+pub struct EncoderBuilder {
+    decoder_memory_requirement: u64,
+    max_packet_size: u16,
+}
+
+impl EncoderBuilder {
+    pub fn new() -> EncoderBuilder {
+        EncoderBuilder {
+            decoder_memory_requirement: 10 * 1024 * 1024,
+            max_packet_size: 1024,
+        }
+    }
+
+    pub fn set_decoder_memory_requirement(&mut self, bytes: u64) {
+        self.decoder_memory_requirement = bytes;
+    }
+
+    pub fn set_max_packet_size(&mut self, bytes: u16) {
+        self.max_packet_size = bytes;
+    }
+
+    pub fn build(&self, data: &[u8]) -> Encoder {
+        let config = ObjectTransmissionInformation::generate_encoding_parameters(
+            data.len() as u64,
+            self.max_packet_size,
+            self.decoder_memory_requirement,
+        );
+
+        Encoder::new(data, config)
+    }
+}
+
+// Calculate the splits [start, end) of an object for encoding as blocks.
+// If a block extends past the end of the object, it must be zero padded
+pub fn calculate_block_offsets(
+    data: &[u8],
+    config: &ObjectTransmissionInformation,
+) -> Vec<(usize, usize)> {
+    let kt = int_div_ceil(config.transfer_length(), config.symbol_size() as u64);
+
+    let (kl, ks, zl, zs) = partition(kt, config.source_blocks());
+
+    let mut data_index = 0;
+    let mut blocks = vec![];
+    if zl > 0 {
+        for _ in 0..zl {
+            let offset = kl as usize * config.symbol_size() as usize;
+            blocks.push((data_index, (data_index + offset)));
+            data_index += offset;
+        }
+    }
+
+    if zs > 0 {
+        for _ in zl..(zl + zs) {
+            let offset = ks as usize * config.symbol_size() as usize;
+            if data_index + offset > data.len() {
+                // Should only be possible when Kt * T > F. See third to last paragraph in section 4.4.1.2
+                assert!(kt as usize * config.symbol_size() as usize > data.len());
+            }
+            blocks.push((data_index, (data_index + offset)));
+            data_index += offset;
+        }
+    }
+
+    blocks
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct Encoder {
     config: ObjectTransmissionInformation,
     blocks: Vec<SourceBlockEncoder>,
 }
 
 impl Encoder {
+    pub fn new(data: &[u8], config: ObjectTransmissionInformation) -> Encoder {
+        let mut block_encoders = vec![];
+        let mut cached_plan: Option<SourceBlockEncodingPlan> = None;
+        for (i, (start, end)) in calculate_block_offsets(data, &config).drain(..).enumerate() {
+            // Zero pad if necessary
+            let mut padded;
+            let block: &[u8] = if end > data.len() {
+                padded = Vec::from(&data[start..]);
+                padded.extend(vec![0; end - data.len()]);
+                &padded
+            } else {
+                &data[start..end]
+            };
+
+            let symbol_count = block.len() / config.symbol_size() as usize;
+            if cached_plan.is_none()
+                || cached_plan.as_ref().unwrap().source_symbol_count != symbol_count as u16
+            {
+                let plan = SourceBlockEncodingPlan::generate(symbol_count as u16);
+                cached_plan = Some(plan);
+            }
+            block_encoders.push(SourceBlockEncoder::with_encoding_plan2(
+                i as u8,
+                &config,
+                block,
+                cached_plan.as_ref().unwrap(),
+            ));
+        }
+
+        Encoder {
+            config,
+            blocks: block_encoders,
+        }
+    }
+
     pub fn with_defaults(data: &[u8], maximum_transmission_unit: u16) -> Encoder {
         let config = ObjectTransmissionInformation::with_defaults(
             data.len() as u64,
             maximum_transmission_unit,
         );
 
-        let kt = (config.transfer_length() as f64 / config.symbol_size() as f64).ceil() as u32;
-        let (kl, ks, zl, zs) = partition(kt, config.source_blocks());
-
-        // TODO: support subblocks
-        assert_eq!(1, config.sub_blocks());
-        //        let (tl, ts, nl, ns) = partition((config.symbol_size() / config.alignment() as u16) as u32, config.sub_blocks());
-
-        let mut data_index = 0;
-        let mut blocks = vec![];
-        if zl > 0 {
-            let kl_plan = SourceBlockEncodingPlan::generate(kl as u16);
-            for i in 0..zl {
-                let offset = kl as usize * config.symbol_size() as usize;
-                blocks.push(SourceBlockEncoder::with_encoding_plan(
-                    i as u8,
-                    config.symbol_size(),
-                    &data[data_index..(data_index + offset)],
-                    &kl_plan,
-                ));
-                data_index += offset;
-            }
-        }
-
-        if zs > 0 {
-            let ks_plan = SourceBlockEncodingPlan::generate(ks as u16);
-            for i in 0..zs {
-                let offset = ks as usize * config.symbol_size() as usize;
-                if data_index + offset <= data.len() {
-                    blocks.push(SourceBlockEncoder::with_encoding_plan(
-                        i as u8,
-                        config.symbol_size(),
-                        &data[data_index..(data_index + offset)],
-                        &ks_plan,
-                    ));
-                } else {
-                    // Should only be possible when Kt * T > F. See third to last paragraph in section 4.4.1.2
-                    assert!(kt as usize * config.symbol_size() as usize > data.len());
-                    // Zero pad the last symbol
-                    let mut padded = Vec::from(&data[data_index..]);
-                    padded.extend(vec![
-                        0;
-                        kt as usize * config.symbol_size() as usize - data.len()
-                    ]);
-                    blocks.push(SourceBlockEncoder::new(
-                        i as u8,
-                        config.symbol_size(),
-                        &padded,
-                    ));
-                }
-                data_index += offset;
-            }
-        }
-
-        Encoder { config, blocks }
+        Encoder::new(data, config)
     }
 
     pub fn get_config(&self) -> ObjectTransmissionInformation {
-        self.config.clone()
+        self.config
     }
 
     pub fn get_encoded_packets(&self, repair_packets_per_block: u32) -> Vec<EncodingPacket> {
@@ -107,7 +167,8 @@ impl Encoder {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct SourceBlockEncodingPlan {
     operations: Vec<SymbolOps>,
     source_symbol_count: u16,
@@ -127,7 +188,8 @@ impl SourceBlockEncodingPlan {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct SourceBlockEncoder {
     source_block_id: u8,
     source_symbols: Vec<Symbol>,
@@ -135,16 +197,57 @@ pub struct SourceBlockEncoder {
 }
 
 impl SourceBlockEncoder {
+    #[deprecated(
+        since = "1.3.0",
+        note = "Use the new2() function instead. In version 2.0, that function will replace this one"
+    )]
     pub fn new(source_block_id: u8, symbol_size: u16, data: &[u8]) -> SourceBlockEncoder {
-        assert_eq!(data.len() % symbol_size as usize, 0);
-        let source_symbols: Vec<Symbol> = data
-            .chunks(symbol_size as usize)
-            .map(|x| Symbol::new(Vec::from(x)))
-            .collect();
+        let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
+        SourceBlockEncoder::new2(source_block_id, &config, data)
+    }
+
+    fn create_symbols(config: &ObjectTransmissionInformation, data: &[u8]) -> Vec<Symbol> {
+        assert_eq!(data.len() % config.symbol_size() as usize, 0);
+        if config.sub_blocks() > 1 {
+            let mut symbols = vec![vec![]; data.len() / config.symbol_size() as usize];
+            let (tl, ts, nl, ns) = partition(
+                (config.symbol_size() / config.symbol_alignment() as u16) as u32,
+                config.sub_blocks(),
+            );
+            // Divide the block into sub-blocks and then concatenate the sub-symbols into symbols
+            // See second to last paragraph in section 4.4.1.2.
+            let mut offset = 0;
+            for sub_block in 0..(nl + ns) {
+                let bytes = if sub_block < nl {
+                    tl as usize * config.symbol_alignment() as usize
+                } else {
+                    ts as usize * config.symbol_alignment() as usize
+                };
+                for symbol in &mut symbols {
+                    symbol.extend_from_slice(&data[offset..offset + bytes]);
+                    offset += bytes;
+                }
+            }
+            assert_eq!(offset, data.len());
+            symbols.drain(..).map(Symbol::new).collect()
+        } else {
+            data.chunks(config.symbol_size() as usize)
+                .map(|x| Symbol::new(Vec::from(x)))
+                .collect()
+        }
+    }
+
+    // TODO: rename this to new() in version 2.0
+    pub fn new2(
+        source_block_id: u8,
+        config: &ObjectTransmissionInformation,
+        data: &[u8],
+    ) -> SourceBlockEncoder {
+        let source_symbols = SourceBlockEncoder::create_symbols(config, data);
 
         let (intermediate_symbols, _) = gen_intermediate_symbols(
             &source_symbols,
-            symbol_size as usize,
+            config.symbol_size() as usize,
             SPARSE_MATRIX_THRESHOLD,
         );
 
@@ -155,23 +258,34 @@ impl SourceBlockEncoder {
         }
     }
 
+    #[deprecated(
+        since = "1.3.0",
+        note = "Use the with_encoding_plan2() function instead. In version 2.0, that function will replace this one"
+    )]
     pub fn with_encoding_plan(
         source_block_id: u8,
         symbol_size: u16,
         data: &[u8],
         plan: &SourceBlockEncodingPlan,
     ) -> SourceBlockEncoder {
-        assert_eq!(data.len() % symbol_size as usize, 0);
-        let source_symbols: Vec<Symbol> = data
-            .chunks(symbol_size as usize)
-            .map(|x| Symbol::new(Vec::from(x)))
-            .collect();
+        let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
+        SourceBlockEncoder::with_encoding_plan2(source_block_id, &config, data, plan)
+    }
+
+    // TODO: rename this to with_encoding_plan() in version 2.0
+    pub fn with_encoding_plan2(
+        source_block_id: u8,
+        config: &ObjectTransmissionInformation,
+        data: &[u8],
+        plan: &SourceBlockEncodingPlan,
+    ) -> SourceBlockEncoder {
+        let source_symbols = SourceBlockEncoder::create_symbols(config, data);
         // TODO: this could be more lenient and support anything with the same extended symbol count
         assert_eq!(source_symbols.len(), plan.source_symbol_count as usize);
 
         let intermediate_symbols = gen_intermediate_symbols_with_plan(
             &source_symbols,
-            symbol_size as usize,
+            config.symbol_size() as usize,
             &plan.operations,
         );
 
@@ -199,12 +313,12 @@ impl SourceBlockEncoder {
     // See section 5.3.4
     pub fn repair_packets(&self, start_repair_symbol_id: u32, packets: u32) -> Vec<EncodingPacket> {
         let source_symbols = self.source_symbols.len() as u32;
-        let start_encoding_symbol_id = start_repair_symbol_id - source_symbols 
-            + extended_source_block_symbols(source_symbols);
+        let start_encoding_symbol_id = 
+            start_repair_symbol_id - source_symbols + extended_source_block_symbols(source_symbols);
         let mut result = vec![];
         let lt_symbols = num_lt_symbols(source_symbols);
         let pi_symbols = num_pi_symbols(source_symbols);
-        let sys_index = systematic_index(source_symbols as u32);
+        let sys_index = systematic_index(source_symbols);
         let p1 = calculate_p1(source_symbols, pi_symbols);
         for i in 0..packets {
             let tuple = intermediate_tuple(start_encoding_symbol_id + i, lt_symbols, sys_index, p1);
@@ -240,7 +354,7 @@ fn create_d(
         D.push(symbol.clone());
     }
     // Extend the source block with padding. See section 5.3.2
-    for _ in 0..(extended_source_symbols as usize - source_block.len()) {
+    for _ in 0..(extended_source_symbols - source_block.len()) {
         D.push(Symbol::zero(symbol_size));
     }
     assert_eq!(D.len(), L as usize);
@@ -261,11 +375,11 @@ fn gen_intermediate_symbols(
     if extended_source_symbols >= sparse_threshold {
         let (A, hdpc) =
             generate_constraint_matrix::<SparseBinaryMatrix>(extended_source_symbols, &indices);
-        fused_inverse_mul_symbols(A, hdpc, D, extended_source_symbols)
+        return fused_inverse_mul_symbols(A, hdpc, D, extended_source_symbols);
     } else {
         let (A, hdpc) =
             generate_constraint_matrix::<DenseBinaryMatrix>(extended_source_symbols, &indices);
-        fused_inverse_mul_symbols(A, hdpc, D, extended_source_symbols)
+        return fused_inverse_mul_symbols(A, hdpc, D, extended_source_symbols);
     }
 }
 

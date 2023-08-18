@@ -1,10 +1,23 @@
+#[cfg(feature = "std")]
+use std::{cmp::min, vec::Vec};
+
+#[cfg(not(feature = "std"))]
+use core::cmp::min;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::rng::rand;
-use crate::systematic_constants::SYSTEMATIC_INDICES_AND_PARAMETERS;
+use crate::systematic_constants::{
+    MAX_SOURCE_SYMBOLS_PER_BLOCK, SYSTEMATIC_INDICES_AND_PARAMETERS,
+};
+use crate::util::int_div_ceil;
+#[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
-use std::cmp::min;
 
 // As defined in section 3.2
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct PayloadId {
     source_block_number: u8,
     encoding_symbol_id: u32,
@@ -49,7 +62,8 @@ impl PayloadId {
 /// Contains encoding symbols generated from a source block.
 ///
 /// As defined in section [4.4.2](https://tools.ietf.org/html/rfc6330#section-4.4.2).
-#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct EncodingPacket {
     pub(crate) payload_id: PayloadId,
     pub(crate) data: Vec<u8>,
@@ -72,7 +86,7 @@ impl EncodingPacket {
         let mut serialized = Vec::with_capacity(4 + self.data.len());
         serialized.extend_from_slice(&self.payload_id.serialize());
         serialized.extend(self.data.iter());
-        serialized
+        return serialized;
     }
 
     /// Retrieves packet payload ID.
@@ -92,7 +106,8 @@ impl EncodingPacket {
 }
 
 // As defined in section 3.3.2 and 3.3.3
-#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct ObjectTransmissionInformation {
     transfer_length: u64, // Limited to u40
     symbol_size: u16,
@@ -112,6 +127,16 @@ impl ObjectTransmissionInformation {
         // See errata (https://www.rfc-editor.org/errata/eid5548)
         assert!(transfer_length <= 942574504275);
         assert_eq!(symbol_size % alignment as u16, 0);
+        // See section 4.4.1.2. "These parameters MUST be set so that ceil(ceil(F/T)/Z) <= K'_max."
+
+        if (symbol_size != 0) && (source_blocks != 0) {
+            let symbols_required = int_div_ceil(
+                int_div_ceil(transfer_length, symbol_size as u64) as u64,
+                source_blocks as u64,
+            );
+            assert!((symbols_required) <= MAX_SOURCE_SYMBOLS_PER_BLOCK);
+        }
+
         ObjectTransmissionInformation {
             transfer_length,
             symbol_size,
@@ -172,35 +197,36 @@ impl ObjectTransmissionInformation {
         self.symbol_alignment
     }
 
-    pub fn with_defaults(
+    pub(crate) fn generate_encoding_parameters(
         transfer_length: u64,
         max_packet_size: u16,
+        decoder_memory_requirement: u64,
     ) -> ObjectTransmissionInformation {
         let alignment = 8;
         assert!(max_packet_size >= alignment);
         let symbol_size = max_packet_size - (max_packet_size % alignment);
-        let max_memory = 10 * 1024 * 1024;
         let sub_symbol_size = 8;
 
-        let kt = (transfer_length as f64 / symbol_size as f64).ceil();
-        let n_max = (symbol_size as f64 / (sub_symbol_size * alignment) as f64).floor() as u32;
+        let kt = int_div_ceil(transfer_length, symbol_size as u64);
+
+        let n_max = symbol_size as u32 / (sub_symbol_size * alignment) as u32;
 
         let kl = |n: u32| -> u32 {
             for &(kprime, _, _, _, _) in SYSTEMATIC_INDICES_AND_PARAMETERS.iter().rev() {
-                let x = (symbol_size as f64 / (alignment as u32 * n) as f64).ceil();
-                if kprime <= (max_memory as f64 / (alignment as f64 * x)) as u32 {
+                let x = int_div_ceil(symbol_size as u64, alignment as u64 * n as u64);
+                if kprime <= (decoder_memory_requirement / (alignment as u64 * x as u64)) as u32 {
                     return kprime;
                 }
             }
             unreachable!();
         };
 
-        let num_source_blocks = (kt / kl(n_max) as f64).ceil() as u32;
+        let num_source_blocks = int_div_ceil(kt as u64, kl(n_max) as u64);
 
         let mut n = 1;
         for i in 1..=n_max {
             n = i;
-            if (kt / num_source_blocks as f64).ceil() as u32 <= kl(n) {
+            if int_div_ceil(kt as u64, num_source_blocks as u64) <= kl(n) {
                 break;
             }
         }
@@ -213,6 +239,17 @@ impl ObjectTransmissionInformation {
             symbol_alignment: alignment as u8,
         }
     }
+
+    pub fn with_defaults(
+        transfer_length: u64,
+        max_packet_size: u16,
+    ) -> ObjectTransmissionInformation {
+        ObjectTransmissionInformation::generate_encoding_parameters(
+            transfer_length,
+            max_packet_size,
+            10 * 1024 * 1024,
+        )
+    }
 }
 
 // Partition[I, J] function, as defined in section 4.4.1.2
@@ -222,8 +259,10 @@ where
     TJ: Into<u32>,
 {
     let (i, j) = (i.into(), j.into());
-    let il = (i as f64 / j as f64).ceil() as u32;
-    let is = (i as f64 / j as f64).floor() as u32;
+    let il = int_div_ceil(i as u64, j as u64);
+
+    let is = i / j;
+
     let jl = i - is * j;
     let js = j - jl;
     (il, is, jl, js)

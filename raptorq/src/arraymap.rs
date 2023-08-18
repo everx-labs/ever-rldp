@@ -1,7 +1,13 @@
-use serde::{Deserialize, Serialize};
-use std::mem::size_of;
+#[cfg(feature = "std")]
+use std::{mem::size_of, ops::Range, u32, vec::Vec};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg(not(feature = "std"))]
+use core::{mem::size_of, ops::Range, u32};
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 // Map<u16, Vec<u32>>
 pub struct ImmutableListMap {
     // offset of std::u32::MAX indicates that the key is not present
@@ -50,9 +56,9 @@ impl ImmutableListMapBuilder {
     pub fn build(self) -> ImmutableListMap {
         let mut entries = self.entries;
         entries.sort_unstable_by_key(|x| x.0);
-        assert!(entries.len() < std::u32::MAX as usize);
+        assert!(entries.len() < u32::MAX as usize);
         assert!(!entries.is_empty());
-        let mut offsets = vec![std::u32::MAX; self.num_keys];
+        let mut offsets = vec![u32::MAX; self.num_keys];
         let mut last_key = entries[0].0;
         offsets[last_key as usize] = 0;
         let mut values = vec![];
@@ -64,7 +70,7 @@ impl ImmutableListMapBuilder {
             values.push(*value);
         }
         for i in (0..offsets.len()).rev() {
-            if offsets[i] == std::u32::MAX {
+            if offsets[i] == u32::MAX {
                 if i == offsets.len() - 1 {
                     offsets[i] = entries.len() as u32;
                 } else {
@@ -77,7 +83,7 @@ impl ImmutableListMapBuilder {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct UndirectedGraph {
     edges: Vec<(u16, u16)>,
     // Mapping from node id to starting index in edges array
@@ -158,7 +164,7 @@ impl<'a, T: Iterator<Item = &'a (u16, u16)>> Iterator for AdjacentIterator<T> {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct U16ArrayMap {
     offset: usize,
     elements: Vec<u16>,
@@ -180,6 +186,10 @@ impl U16ArrayMap {
         self.elements.swap(key, other_key);
     }
 
+    pub fn keys(&self) -> Range<usize> {
+        self.offset..(self.offset + self.elements.len())
+    }
+
     pub fn insert(&mut self, key: usize, value: u16) {
         self.elements[key - self.offset] = value;
     }
@@ -192,13 +202,12 @@ impl U16ArrayMap {
         self.elements[key - self.offset] -= 1;
     }
 
-    #[allow(dead_code)]
     pub fn increment(&mut self, key: usize) {
         self.elements[key - self.offset] += 1;
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct U32VecMap {
     offset: usize,
     elements: Vec<u32>,
@@ -215,7 +224,7 @@ impl U32VecMap {
     pub fn with_capacity(start_key: usize, end_key: usize) -> U32VecMap {
         U32VecMap {
             offset: start_key,
-            elements: vec![0; end_key],
+            elements: vec![0; end_key - start_key],
         }
     }
 
@@ -228,11 +237,6 @@ impl U32VecMap {
 
     pub fn size_in_bytes(&self) -> usize {
         size_of::<Self>() + size_of::<u32>() * self.elements.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn swap(&mut self, key: usize, other_key: usize) {
-        self.elements.swap(key, other_key);
     }
 
     #[allow(dead_code)]
@@ -256,29 +260,6 @@ impl U32VecMap {
     pub fn increment(&mut self, key: usize) {
         self.grow_if_necessary(key - self.offset);
         self.elements[key - self.offset] += 1;
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub struct BoolArrayMap {
-    offset: usize,
-    elements: Vec<bool>,
-}
-
-impl BoolArrayMap {
-    pub fn new(start_key: usize, end_key: usize) -> BoolArrayMap {
-        BoolArrayMap {
-            offset: start_key,
-            elements: vec![false; end_key - start_key],
-        }
-    }
-
-    pub fn insert(&mut self, key: usize, value: bool) {
-        self.elements[key - self.offset] = value;
-    }
-
-    pub fn get(&self, key: usize) -> bool {
-        self.elements[key - self.offset]
     }
 }
 
