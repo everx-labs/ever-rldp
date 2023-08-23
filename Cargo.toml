@@ -3,7 +3,7 @@ build = './common/build/build.rs'
 description = 'RLDP library'
 edition = '2021'
 name = 'rldp'
-version = '0.7.214'
+version = '0.7.215'
 
 [dependencies]
 async-trait = '0.1'
@@ -11,12 +11,12 @@ enum-as-inner = '=0.5.1'
 failure = '0.1'
 log = '0.4'
 rand = '0.7'
-adnl = { features = [ 'node' ], git = 'https://github.com/tonlabs/ever-adnl.git', tag = '0.8.24' }
+adnl = { features = [ 'node' ], git = 'https://github.com/tonlabs/ever-adnl.git', tag = '0.8.25' }
 lockfree = { git = 'https://github.com/tonlabs/lockfree.git' }
 raptorq = { path = 'raptorq', version = '1.2.1' }
 tokio = { features = [ 'rt-multi-thread' ], version = '1.5' }
-ton_api = { git = 'https://github.com/tonlabs/ever-tl.git', package = 'ton_api', tag = '0.3.27' }
-ton_types = { git = 'https://github.com/tonlabs/ever-types.git', tag = '2.0.19' }
+ton_api = { git = 'https://github.com/tonlabs/ever-tl.git', package = 'ton_api', tag = '0.3.28' }
+ton_types = { git = 'https://github.com/tonlabs/ever-types.git', tag = '2.0.20' }
 
 [features]
 telemetry = [ 'adnl/telemetry' ]
