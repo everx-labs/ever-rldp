@@ -608,11 +608,11 @@ impl RldpNode {
 
     const MAX_QUERIES: u32 = 3;
     const SIZE_TRANSFER_WAVE: u32 = 10;
-    const SPINNER: u64 = 10;           // Milliseconds
-    const TIMEOUT_MAX: u64 = 10000;    // Milliseconds
-    const TIMEOUT_MIN: u64 = 500;      // Milliseconds
+    const SPINNER_MS: u64 = 10;            // Milliseconds
+    const TIMEOUT_MAX_MS: u64 = 10000;     // Milliseconds
+    const TIMEOUT_MIN_MS: u64 = 500;       // Milliseconds
     #[cfg(feature = "telemetry")]
-    const TIMEOUT_TELEMETRY: u64 = 10; // Seconds
+    const TIMEOUT_TELEMETRY_SEC: u64 = 10; // Seconds
     
     /// Constructor 
     pub fn with_adnl_node(
@@ -743,7 +743,7 @@ impl RldpNode {
                 let now = RldpStats::dec(&stats.transfers_recv_now);
                 #[cfg(feature = "telemetry")]
                 log::trace!(target: TARGET, "RLDP STAT recv: transfers total {}, active {}", all, now);
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX * 2)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)).await;
                 if let Some(send_transfer_id) = send_transfer_id {
                     transfers.remove(&send_transfer_id);
                 }
@@ -754,7 +754,7 @@ impl RldpNode {
         let transfer_id = *transfer_id;
         tokio::spawn(
             async move {
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)).await;
                 transfers.insert(transfer_id, RldpTransfer::Done);
             }
         );
@@ -781,6 +781,16 @@ impl RldpNode {
         }
 
         let mut query = deserialize_query(context)?;
+        let now = Version::get();
+        if now > query.timeout + Self::TIMEOUT_MAX_MS as i32 / 1000 {
+            fail!(
+                "RLDP query was received expired on {} sec in transfer {} from {}",
+                now - query.timeout,
+                base64_encode(&context.transfer_id),
+                context.peers.other()  
+            )
+        }
+
         let compression = if let Some(data) = DataCompression::decompress(&query.data) {
             context.adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION); 
             query.data = ton::bytes(data);
@@ -790,25 +800,19 @@ impl RldpNode {
         };
         #[cfg(feature = "telemetry")]
         let query_tag = Self::fetch_tag(&query.data[..]);
-        let answer = if let (true, answer) = Query::process_rldp(
-            &subscribers, 
-            &query, 
-            &context.peers
-        ).await? {
-            let answer = if let Some(mut answer) = answer {
-                if compression {
-                    answer.object.data = ton::bytes(
-                        DataCompression::compress(&answer.object.data)?
-                    );
-                }
-                answer
-            } else {
-                return Ok(None)
-            }; 
-            answer
-        } else {
+        let Some(answer) = Query::process_rldp(&subscribers, &query, &context.peers).await? else {
             fail!("No subscribers for query {:?}", query)
         };
+        let answer = match answer.try_finalize()? {
+            (Some(answer), _) => answer.wait().await?,
+            (None, answer) => answer
+        };
+        let Some(mut answer) = answer else {
+            return Ok(None)
+        }; 
+        if compression {
+            answer.object.data = ton::bytes(DataCompression::compress(&answer.object.data)?);
+        }
         let (len, max) = (answer.object.data.len(), query.max_answer_size as usize);
         if len > max {
             fail!("Exceeded max RLDP answer size: {} vs {}", len, max)
@@ -820,25 +824,13 @@ impl RldpNode {
         for x in &mut send_transfer_id {
             *x ^= 0xFF
         } 
-        let now = Version::get();
-        if now >= query.timeout {
-            log::warn!(
-                target: TARGET, 
-                "RLDP answer will be sent expired on {} sec in transfer {}/{} to {}",
-                now - query.timeout,
-                base64_encode(&context.transfer_id),
-                base64_encode(&send_transfer_id),
-                context.peers.other()  
-            )
-        } else {
-            log::trace!(
-                target: TARGET, 
-                "RLDP answer to be sent in transfer {}/{} to {}",
-                base64_encode(&context.transfer_id),
-                base64_encode(&send_transfer_id),
-                context.peers.other()  
-            )
-        }
+        log::trace!(
+            target: TARGET, 
+            "RLDP answer to be sent in transfer {}/{} to {}",
+            base64_encode(&context.transfer_id),
+            base64_encode(&send_transfer_id),
+            context.peers.other()  
+        );
         let send_transfer = SendTransfer::new(
             &data[..], 
             Some(send_transfer_id), 
@@ -894,7 +886,7 @@ impl RldpNode {
     }
 
     fn calc_timeout(roundtrip: Option<u64>) -> u64 {
-        max(roundtrip.unwrap_or(Self::TIMEOUT_MAX), Self::TIMEOUT_MIN)
+        max(roundtrip.unwrap_or(Self::TIMEOUT_MAX_MS), Self::TIMEOUT_MIN_MS)
     }
 
     fn check_message(message: &RldpMessagePartBoxed) -> Result<()> {
@@ -950,7 +942,7 @@ impl RldpNode {
         let message = RldpQuery {
             query_id: UInt256::with_array(query_id),
             max_answer_size: max_answer_size.unwrap_or(128 * 1024),
-            timeout: Version::get() + Self::TIMEOUT_MAX as i32/1000,
+            timeout: Version::get() + Self::TIMEOUT_MAX_MS as i32/1000,
             data: ton::bytes(data)
         }.into_boxed();
         let data = serialize_boxed(&message)?;
@@ -1055,7 +1047,7 @@ impl RldpNode {
         let transfers = self.transfers.clone();
         tokio::spawn(
             async move {
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX * 2)).await;
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)).await;
                 transfers.remove(&send_transfer_id); 
                 transfers.remove(&recv_transfer_id); 
             }
@@ -1157,7 +1149,7 @@ impl RldpNode {
         let mut start_part = Instant::now();
         let mut updates = recv_state.updates();
         loop {
-            tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
+            tokio::time::sleep(Duration::from_millis(Self::SPINNER_MS)).await;
             let new_updates = recv_state.updates();
             if new_updates > updates {
                 log::trace!(
@@ -1273,7 +1265,7 @@ impl RldpNode {
                         break 'part;
                     }
                 }                                                                                                                         
-                tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;
+                tokio::time::sleep(Duration::from_millis(Self::SPINNER_MS)).await;
                 if context.send_transfer.is_finished_or_next_part(part)? {
                     break;
                 }
@@ -1288,7 +1280,7 @@ impl RldpNode {
                     recv_seqno = new_recv_seqno;
                     start_part = Instant::now();
                 } else if Self::is_timed_out(timeout, recv_seqno, &start_part) {
-                    return Ok((false, min(roundtrip * 2, Self::TIMEOUT_MAX)))
+                    return Ok((false, min(roundtrip * 2, Self::TIMEOUT_MAX_MS)))
                 }                
             }
             timeout = Self::update_roundtrip(&mut roundtrip, &start_part);
@@ -1312,7 +1304,7 @@ impl Subscriber for RldpNode {
 
     #[cfg(feature = "telemetry")]
     async fn poll(&self, start: &Arc<Instant>) {
-        if ((start.elapsed().as_secs() + 1) % Self::TIMEOUT_TELEMETRY) == 0 {
+        if ((start.elapsed().as_secs() + 1) % Self::TIMEOUT_TELEMETRY_SEC) == 0 {
             self.print_stats()
         }
         self.telemetry.peers.update(self.allocated.peers.load(Ordering::Relaxed));        
