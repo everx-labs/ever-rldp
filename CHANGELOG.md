@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.8.0
+
+- Ignore expired RLDP queries
+- Async processing of queries
+- Increase package version
+- Update CHANGELOG file
+
 ## Version 0.7.212
 
 - Update raptorQ crate to 1.7.0
