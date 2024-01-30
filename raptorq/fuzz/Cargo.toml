@@ -1,10 +1,10 @@
 [package]
 authors = [ 'Automatically generated' ]
 edition = '2018'
+metadata = { cargo-fuzz = true }
 name = 'raptorq-fuzz'
 publish = false
 version = '0.0.0'
-metadata = { cargo-fuzz = true }
 
 [workspace]
 members = [ '.' ]
@@ -16,8 +16,8 @@ path = 'fuzz_targets/fuzz_raptorq.rs'
 test = false
 
 [dependencies]
-rand = '0.8.5'
 arbitrary = { features = [ 'derive' ], version = '1.1.0' }
 libfuzzer-sys = { features = [ 'arbitrary-derive' ], version = '0.4.0' }
+rand = '0.8.5'
 raptorq = { path = '..' }
 
