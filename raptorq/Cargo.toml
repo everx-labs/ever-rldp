@@ -29,17 +29,14 @@ harness = false
 name = 'codec_benchmark'
 required-features = [ 'benchmarking' ]
 
-
 [[bench]]
 harness = false
 name = 'matrix_sparsity'
 required-features = [ 'benchmarking' ]
 
-
 [[bench]]
 harness = false
 name = 'encode_benchmark'
-
 
 [[bench]]
 harness = false
