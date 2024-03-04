@@ -6,22 +6,18 @@ All notable changes to this project will be documented in this file.
 
 - Ignore expired RLDP queries
 - Async processing of queries
-- Increase package version
-- Update CHANGELOG file
 
 ## Version 0.7.212
 
 - Update raptorQ crate to 1.7.0
-- Increase package version
-- Update CHANGELOG.md file
 
 ## Version 0.7.210
 
-- Refactor RLPD message sanity check
+- Refactor RLDP message sanity check
 
 ## Version 0.7.209
 
-- Added RLPD message sanity check
+- Added RLDP message sanity check
 
 ## Version 0.7.200
 
