@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.8.20
+
+- Rebranding ton -> everx
+- Get rid of ton::bytes type
+
 ## Version 0.8.0
 
 - Ignore expired RLDP queries

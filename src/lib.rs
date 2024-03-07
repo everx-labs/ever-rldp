@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2023 EverX. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -7,9 +7,13 @@
 * Unless required by applicable law or agreed to in writing, software
 * distributed under the License is distributed on an "AS IS" BASIS,
 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific TON DEV software governing permissions and
+* See the License for the specific EVERX DEV software governing permissions and
 * limitations under the License.
 */
+
+// TO REMOVE AFTER FULL REBRANDING
+extern crate ton_api as ever_api;
+extern crate ton_types as ever_types;
 
 use adnl::{ 
     declare_counted, dump, 
@@ -26,10 +30,10 @@ use std::{
     cmp::{min, max}, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, 
     time::{Duration, Instant}
 };
-use ton_api::{
+use ever_api::{
     deserialize_boxed, IntoBoxed, serialize_bare_inplace, serialize_boxed, 
-    ton::{
-        self, fec::{Type as FecType, type_::RaptorQ as FecTypeRaptorQ}, 
+    ton::{ //ever::{
+        fec::{Type as FecType, type_::RaptorQ as FecTypeRaptorQ}, 
         rldp::{
             Message as RldpMessageBoxed, MessagePart as RldpMessagePartBoxed, 
             message::Query as RldpQuery, messagepart::Complete as RldpComplete, 
@@ -38,8 +42,8 @@ use ton_api::{
     }
 };
 #[cfg(feature = "telemetry")]
-use ton_api::{tag_from_bare_object, tag_from_bare_type};
-use ton_types::{error, fail, base64_encode, KeyId, Result, UInt256};
+use ever_api::{tag_from_bare_object, tag_from_bare_type};
+use ever_types::{error, fail, base64_encode, KeyId, Result, UInt256};
 pub use raptorq;
 
 include!("../common/src/info.rs");
@@ -376,7 +380,7 @@ impl <'a> SendTransfer<'a> {
             part: 0,
             total_size: 0,
             seqno: 0,
-            data: ton::bytes(Vec::new())
+            data: Vec::new()
         };
         let state = Arc::new(SendTransferState {
             part: AtomicU32::new(0),
@@ -422,7 +426,7 @@ impl <'a> SendTransfer<'a> {
             let chunk = encoder.encode(&mut seqno_sent)?;
             let message = self.message_mut()?;
             message.seqno = seqno_sent as i32;
-            message.data = ton::bytes(chunk);
+            message.data = chunk;
             let seqno_recv = self.state.seqno_recv();
             if seqno_sent - seqno_recv <= Self::WINDOW as u32 {
                 if seqno_sent_original == seqno_sent {
@@ -793,7 +797,7 @@ impl RldpNode {
 
         let compression = if let Some(data) = DataCompression::decompress(&query.data) {
             context.adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION); 
-            query.data = ton::bytes(data);
+            query.data = data;
             true
         } else {
             context.adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION)
@@ -811,7 +815,7 @@ impl RldpNode {
             return Ok(None)
         }; 
         if compression {
-            answer.object.data = ton::bytes(DataCompression::compress(&answer.object.data)?);
+            answer.object.data = DataCompression::compress(&answer.object.data)?;
         }
         let (len, max) = (answer.object.data.len(), query.max_answer_size as usize);
         if len > max {
@@ -943,7 +947,7 @@ impl RldpNode {
             query_id: UInt256::with_array(query_id),
             max_answer_size: max_answer_size.unwrap_or(128 * 1024),
             timeout: Version::get() + Self::TIMEOUT_MAX_MS as i32/1000,
-            data: ton::bytes(data)
+            data
         }.into_boxed();
         let data = serialize_boxed(&message)?;
         let peer = if let Some(peer) = self.peers.get(peers.other()) {
