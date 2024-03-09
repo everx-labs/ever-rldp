@@ -3,7 +3,7 @@ build = './common/build/build.rs'
 description = 'RLDP library'
 edition = '2021'
 name = 'rldp'
-version = '0.8.21'
+version = '0.8.22'
 
 [dependencies]
 async-trait = '0.1'
@@ -20,4 +20,7 @@ ton_types = { git = 'https://github.com/tonlabs/ever-types.git', tag = '2.0.33' 
 
 [features]
 telemetry = [ 'adnl/telemetry' ]
+
+[lib]
+path = 'src/rldplib.rs'
 
