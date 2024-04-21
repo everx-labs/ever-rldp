@@ -1,3 +1,7 @@
+# WARNING! This repository is obsolete
+
+RLDP protocol implementation was merged into the repository https://github.com/tonlabs/ever-adnl.git
+
 # RLDP
 
 RLDP protocol implementation
